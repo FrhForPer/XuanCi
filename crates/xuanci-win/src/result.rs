@@ -9,10 +9,11 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM}
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos, GetWindowLongPtrW,
-    GetWindowRect, PostMessageW, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowLongPtrW,
-    SetWindowTextW, SetWindowPos, ShowWindow, CREATESTRUCTW, CW_USEDEFAULT, GWLP_USERDATA,
-    HWND_TOP, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, WINDOW_EX_STYLE, WM_CLOSE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos,
+    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, PostMessageW, RegisterClassW,
+    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowTextW, SetWindowPos,
+    ShowWindow, CREATESTRUCTW, CW_USEDEFAULT, GWLP_USERDATA, HWND_TOP, SM_CXSCREEN,
+    SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, WINDOW_EX_STYLE, WM_CLOSE,
     WM_COMMAND, WM_CREATE, WM_DESTROY, WM_GETTEXT, WM_GETTEXTLENGTH, WM_NCCREATE, WM_SIZE,
     WINDOW_STYLE, WM_SETFONT, WNDCLASSW, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW,
     WS_VISIBLE, WS_VSCROLL,
@@ -148,14 +149,34 @@ fn center_near_cursor(hwnd: HWND) {
         let monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
         let mut mi: MONITORINFO = zeroed();
         mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-        let _ = GetMonitorInfoW(monitor, &mut mi);
+
+        let work = if GetMonitorInfoW(monitor, &mut mi).as_bool()
+            && mi.rcWork.right > mi.rcWork.left
+            && mi.rcWork.bottom > mi.rcWork.top
+        {
+            mi.rcWork
+        } else {
+            RECT {
+                left: 0,
+                top: 0,
+                right: GetSystemMetrics(SM_CXSCREEN),
+                bottom: GetSystemMetrics(SM_CYSCREEN),
+            }
+        };
 
         let mut rect = RECT::default();
         let _ = GetWindowRect(hwnd, &mut rect);
         let w = rect.right - rect.left;
         let h = rect.bottom - rect.top;
-        let x = (mi.rcWork.left + mi.rcWork.right - w) / 2;
-        let y = (mi.rcWork.top + mi.rcWork.bottom - h) / 2;
+
+        let margin = 8;
+        let min_x = work.left + margin;
+        let max_x = (work.right - w - margin).max(min_x);
+        let min_y = work.top + margin;
+        let max_y = (work.bottom - h - margin).max(min_y);
+        let x = ((work.left + work.right - w) / 2).max(min_x).min(max_x);
+        let y = ((work.top + work.bottom - h) / 2).max(min_y).min(max_y);
+
         let _ = SetWindowPos(
             hwnd,
             Some(HWND_TOP),

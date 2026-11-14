@@ -4,13 +4,17 @@ use std::cell::RefCell;
 use std::mem::zeroed;
 
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, GetStockObject, MonitorFromPoint, DEFAULT_GUI_FONT, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetWindowLongPtrW, GetWindowRect, HMENU, IsWindow, MessageBoxW, RegisterClassW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
+    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, HMENU, IsWindow, IsWindowVisible,
+    MessageBoxW, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN,
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     TranslateMessage, CREATESTRUCTW, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL,
     ES_MULTILINE, ES_PASSWORD, ES_WANTRETURN, GWLP_USERDATA, HWND_TOP, MSG, MB_ICONERROR,
@@ -243,13 +247,59 @@ pub fn input_text(parent: HWND, spec: InputSpec<'_>) -> Option<String> {
 fn center_on_parent(hwnd: HWND, parent: HWND) {
     unsafe {
         let mut ar = RECT::default();
-        let mut pr = RECT::default();
         let _ = GetWindowRect(hwnd, &mut ar);
-        let _ = GetWindowRect(parent, &mut pr);
         let w = ar.right - ar.left;
         let h = ar.bottom - ar.top;
-        let x = pr.left + (pr.right - pr.left - w) / 2;
-        let y = pr.top + (pr.bottom - pr.top - h) / 2;
+
+        // The app's hidden message window sits at (0,0) with zero size, so
+        // centering on it would place the dialog half off-screen. Only use the
+        // parent when it is a real, visible window.
+        let mut pr = RECT::default();
+        let parent_visible = !parent.0.is_null()
+            && IsWindowVisible(parent).as_bool()
+            && GetWindowRect(parent, &mut pr).is_ok()
+            && pr.right > pr.left
+            && pr.bottom > pr.top;
+
+        let (anchor_x, anchor_y) = if parent_visible {
+            ((pr.left + pr.right) / 2, (pr.top + pr.bottom) / 2)
+        } else {
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            (pt.x, pt.y)
+        };
+
+        let monitor = MonitorFromPoint(
+            POINT {
+                x: anchor_x,
+                y: anchor_y,
+            },
+            MONITOR_DEFAULTTONEAREST,
+        );
+        let mut mi: MONITORINFO = zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        let work = if GetMonitorInfoW(monitor, &mut mi).as_bool()
+            && mi.rcWork.right > mi.rcWork.left
+            && mi.rcWork.bottom > mi.rcWork.top
+        {
+            mi.rcWork
+        } else {
+            RECT {
+                left: 0,
+                top: 0,
+                right: GetSystemMetrics(SM_CXSCREEN),
+                bottom: GetSystemMetrics(SM_CYSCREEN),
+            }
+        };
+
+        let margin = 8;
+        let min_x = work.left + margin;
+        let max_x = (work.right - w - margin).max(min_x);
+        let min_y = work.top + margin;
+        let max_y = (work.bottom - h - margin).max(min_y);
+        let x = (anchor_x - w / 2).max(min_x).min(max_x);
+        let y = (anchor_y - h / 2).max(min_y).min(max_y);
+
         let _ = SetWindowPos(
             hwnd,
             Some(HWND_TOP),
