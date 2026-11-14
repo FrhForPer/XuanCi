@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+
+# Local user data must never be committed
+secrets.bin
+settings.json
+templates.json
+
+# Logs and editor files
+*.log
+.env
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
