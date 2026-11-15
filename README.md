@@ -3,7 +3,8 @@
 Windows 全局划词工具：在任意软件中选中文字，自动弹出小工具条，一键翻译或交给 AI；也支持全局快捷键。
 
 - 原生 Rust + Win32，无 WebView / 无浏览器内核 / 无遥测
-- 兼容任意 OpenAI 格式接口（DeepSeek、OpenAI、硅基流动、通义、智谱、Ollama、LM Studio 等），SSE 流式输出
+- 兼容任意 OpenAI 格式接口（DeepSeek、OpenAI、硅基流动、通义、智谱、Moonshot、Ollama、LM Studio 等），SSE 流式输出
+- 多服务商配置：根据 Base URL 自动识别服务商，每个服务商独立保存地址、模型和 Key，托盘一键切换
 - API Key 使用 Windows DPAPI 加密保存在本机
 - 声明式提示词模板，改 JSON 即可扩展动作
 
@@ -17,7 +18,9 @@ Windows 全局划词工具：在任意软件中选中文字，自动弹出小工
 | 安全策略 | 密码框拒绝、管理员程序提示、终端禁用 Ctrl+C、文件/图片剪贴板回退保护 |
 | 流式结果窗 | 可滚动、复制、停止、关闭 |
 | 模板扩展 | `%LOCALAPPDATA%\XuanCi\templates.json`，重启后出现在工具条 |
-| 设置 | 托盘菜单中设置 API Key、模型、Base URL |
+| 多服务商 | 托盘「服务商」子菜单：切换、添加、编辑、删除；每个服务商独立保存 Key |
+| 自动识别 | 添加服务商时根据 Base URL 识别 DeepSeek/OpenAI/硅基流动/通义/智谱/Moonshot/Ollama/LM Studio，并预填名称与常用模型 |
+| 模型列表 | 「获取模型列表…」调用 `GET {base_url}/models`，从返回结果中选择模型 |
 | 单实例保护 | 重复启动会提示「已在运行」，不会争抢快捷键 |
 | 开机自启 | 托盘菜单勾选，写入 `HKCU\...\Run`，使用 `--autostart` 静默启动 |
 
@@ -43,7 +46,7 @@ cargo build --release
 .\target\release\xuanci.exe
 ```
 
-首次启动会要求输入 DeepSeek API Key（`sk-...`），随后可用托盘菜单修改。
+首次启动会要求输入当前服务商（默认 DeepSeek）的 API Key（`sk-...`），随后可在托盘的「服务商」子菜单里切换、添加其他服务商或修改配置。
 
 调试构建会向 `%TEMP%\xuanci-debug.log` 写入不含正文的诊断信息（捕获耗时、字符数、错误原因）。
 
@@ -53,9 +56,27 @@ cargo build --release
 
 | 文件 | 内容 |
 |---|---|
-| `secrets.bin` | DPAPI 加密的 API Key |
-| `settings.json` | Base URL、模型、翻译目标语言、是否允许自动弹条使用剪贴板回退（默认模型 `deepseek-flash`，官方另可选 `deepseek-v4-pro`） |
+| `secrets.bin` | DPAPI 加密的「服务商 ID → API Key」映射；旧版单 Key 文件会自动迁移 |
+| `settings.json` | 服务商列表、当前服务商、翻译目标语言、是否允许自动弹条使用剪贴板回退（默认模型 `deepseek-flash`，官方另可选 `deepseek-v4-pro`） |
 | `templates.json` | 提示词模板（见下） |
+
+`settings.json` 中的服务商结构：
+
+```json
+{
+  "providers": [
+    {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "base_url": "https://api.deepseek.com",
+      "model": "deepseek-flash"
+    }
+  ],
+  "active_provider": "deepseek"
+}
+```
+
+顶层 `base_url` / `model` 是当前服务商的镜像，由程序自动维护。旧版只有 `base_url` / `model` 的配置会在启动时自动转成服务商列表。
 
 `templates.json` 示例：
 

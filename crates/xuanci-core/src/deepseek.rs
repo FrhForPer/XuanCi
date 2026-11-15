@@ -52,16 +52,7 @@ pub fn stream_chat(
         request.messages.len()
     ));
 
-    // native-tls is never selected implicitly by ureq; it must be configured.
-    let config = ureq::config::Config::builder()
-        .tls_config(
-            ureq::tls::TlsConfig::builder()
-                .provider(ureq::tls::TlsProvider::NativeTls)
-                .build(),
-        )
-        .timeout_global(Some(Duration::from_secs(120)))
-        .build();
-    let agent = config.new_agent();
+    let agent = build_agent(Duration::from_secs(120));
 
     let response = match agent
         .post(&settings.endpoint())
@@ -133,6 +124,70 @@ pub fn stream_chat(
     dbg(&format!("stream eof chunks={chunk_count}"));
     sink(ChatDelta::Done);
     Ok(())
+}
+
+fn build_agent(timeout: Duration) -> ureq::Agent {
+    // native-tls is never selected implicitly by ureq; it must be configured.
+    let config = ureq::config::Config::builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .build(),
+        )
+        .timeout_global(Some(timeout))
+        .build();
+    config.new_agent()
+}
+
+/// Fetches the provider's model list (`GET {base_url}/models`).
+pub fn list_models(settings: &AppSettings, api_key: &str) -> Result<Vec<String>, String> {
+    if api_key.trim().is_empty() {
+        return Err("尚未配置 API Key".into());
+    }
+    if !settings.base_url_is_allowed() {
+        return Err("Base URL 必须使用 HTTPS（本地测试地址除外）".into());
+    }
+
+    let agent = build_agent(Duration::from_secs(20));
+    let response = agent
+        .get(&settings.models_endpoint())
+        .header("Authorization", &format!("Bearer {api_key}"))
+        .call()
+        .map_err(map_ureq_error)?;
+
+    let body = response
+        .into_body()
+        .read_to_string()
+        .map_err(|e| format!("读取模型列表失败：{e}"))?;
+    let value: Value =
+        serde_json::from_str(&body).map_err(|e| format!("解析模型列表失败：{e}"))?;
+
+    let mut models = Vec::new();
+    if let Some(data) = value.get("data").and_then(|v| v.as_array()) {
+        for item in data {
+            if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                models.push(id.to_string());
+            }
+        }
+    } else if let Some(data) = value.get("models").and_then(|v| v.as_array()) {
+        for item in data {
+            if let Some(name) = item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .or_else(|| item.get("model").and_then(|v| v.as_str()))
+            {
+                models.push(name.to_string());
+            }
+        }
+    }
+
+    models.sort();
+    models.dedup();
+    if models.is_empty() {
+        return Err("服务商没有返回可用的模型列表".into());
+    }
+    models.truncate(300);
+    Ok(models)
 }
 
 /// Builds an OpenAI-compatible request body.

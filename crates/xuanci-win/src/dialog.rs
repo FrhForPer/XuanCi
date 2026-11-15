@@ -15,17 +15,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
     GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, HMENU, IsWindow, IsWindowVisible,
     MessageBoxW, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN,
-    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
     TranslateMessage, CREATESTRUCTW, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL,
     ES_MULTILINE, ES_PASSWORD, ES_WANTRETURN, GWLP_USERDATA, HWND_TOP, MSG, MB_ICONERROR,
-    MB_ICONINFORMATION, MB_OK, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_GETTEXT, WM_GETTEXTLENGTH, WM_KEYDOWN,
-    WM_NCCREATE, WM_SETFONT, WM_SETTEXT, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_POPUP,
-    WS_SYSMENU, WS_VISIBLE, WS_VSCROLL,
+    IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNO, SWP_NOSIZE, SWP_NOZORDER,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY,
+    WM_GETTEXT, WM_GETTEXTLENGTH, WM_KEYDOWN, WM_NCCREATE, WM_SETFONT, WM_SETTEXT, WNDCLASSW,
+    WS_BORDER, WS_CAPTION, WS_CHILD, WS_POPUP, WS_SYSMENU, WS_VISIBLE, WS_VSCROLL,
 };
 
 thread_local! {
     static INPUT_RESULT: RefCell<Option<String>> = const { RefCell::new(None) };
+    static SELECT_RESULT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 pub fn info(text: &str) {
@@ -52,6 +53,18 @@ pub fn error(text: &str) {
     }
 }
 
+pub fn confirm(text: &str) -> bool {
+    let text = HSTRING::from(text);
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            w!("XuanCi"),
+            MB_YESNO | MB_ICONQUESTION,
+        ) == IDYES
+    }
+}
+
 pub struct InputSpec<'a> {
     pub title: &'a str,
     pub label: &'a str,
@@ -62,7 +75,6 @@ pub struct InputSpec<'a> {
 
 struct InputState {
     edit: HWND,
-    multiline: bool,
 }
 
 const INPUT_CLASS: &str = "XuanCiInputBox";
@@ -106,10 +118,10 @@ pub fn input_text(parent: HWND, spec: InputSpec<'_>) -> Option<String> {
             None,
         )
         .ok()?;
+        let _ = SetWindowTextW(hwnd, PCWSTR(title.as_ptr()));
 
         let state = Box::new(InputState {
             edit: HWND::default(),
-            multiline: spec.multiline,
         });
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
 
@@ -345,6 +357,267 @@ fn read_control_text(control: HWND) -> String {
             Some(LPARAM(buf.as_mut_ptr() as isize)),
         );
         String::from_utf16_lossy(&buf[..len as usize])
+    }
+}
+
+const SELECT_CLASS: &str = "XuanCiSelectBox";
+
+const LB_ADDSTRING: u32 = 0x0180;
+const LB_SETCURSEL: u32 = 0x0186;
+const LB_GETCURSEL: u32 = 0x0188;
+const LB_GETTEXT: u32 = 0x0189;
+const LB_GETTEXTLEN: u32 = 0x018A;
+const LBS_NOTIFY: u32 = 0x0001;
+const LBN_DBLCLK: u32 = 2;
+
+struct SelectState {
+    list: HWND,
+}
+
+/// Shows a modal list selection dialog. Returns None when cancelled.
+pub fn select_item(
+    parent: HWND,
+    title: &str,
+    label: &str,
+    items: &[String],
+) -> Option<String> {
+    if items.is_empty() {
+        return None;
+    }
+    SELECT_RESULT.with(|slot| *slot.borrow_mut() = None);
+
+    unsafe {
+        let instance = GetModuleHandleW(None).ok()?;
+        let hinstance = HINSTANCE(instance.0);
+        let class = HSTRING::from(SELECT_CLASS);
+        let mut wc: WNDCLASSW = zeroed();
+        wc.lpfnWndProc = Some(select_proc);
+        wc.hInstance = hinstance;
+        wc.lpszClassName = PCWSTR(class.as_ptr());
+        let atom = RegisterClassW(&wc);
+        if atom == 0 {
+            let err = windows::Win32::Foundation::GetLastError();
+            if err.0 != 1410 {
+                return None;
+            }
+        }
+
+        let title_h = HSTRING::from(title);
+        let hwnd = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            PCWSTR(class.as_ptr()),
+            PCWSTR(title_h.as_ptr()),
+            WINDOW_STYLE(WS_POPUP.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_VISIBLE.0),
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            480,
+            480,
+            Some(parent),
+            None,
+            Some(hinstance),
+            None,
+        )
+        .ok()?;
+        let _ = SetWindowTextW(hwnd, PCWSTR(title_h.as_ptr()));
+
+        let state = Box::new(SelectState {
+            list: HWND::default(),
+        });
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+
+        let label_h = HSTRING::from(label);
+        let label_w = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("STATIC"),
+            PCWSTR(label_h.as_ptr()),
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+            16,
+            14,
+            430,
+            36,
+            Some(hwnd),
+            None,
+            Some(hinstance),
+            None,
+        )
+        .unwrap_or_default();
+
+        let list = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("LISTBOX"),
+            w!(""),
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_BORDER.0 | WS_VSCROLL.0 | LBS_NOTIFY),
+            16,
+            56,
+            430,
+            300,
+            Some(hwnd),
+            None,
+            Some(hinstance),
+            None,
+        )
+        .unwrap_or_default();
+
+        if let Some(state) = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SelectState).as_mut() {
+            state.list = list;
+        }
+
+        for item in items {
+            let mut wide: Vec<u16> = item.encode_utf16().chain(std::iter::once(0)).collect();
+            SendMessageW(
+                list,
+                LB_ADDSTRING,
+                Some(WPARAM(0)),
+                Some(LPARAM(wide.as_mut_ptr() as isize)),
+            );
+        }
+        SendMessageW(list, LB_SETCURSEL, Some(WPARAM(0)), Some(LPARAM(0)));
+
+        let ok = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("BUTTON"),
+            w!("确定"),
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+            260,
+            400,
+            88,
+            30,
+            Some(hwnd),
+            Some(HMENU(ID_OK as *mut core::ffi::c_void)),
+            Some(hinstance),
+            None,
+        )
+        .unwrap_or_default();
+        let cancel = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("BUTTON"),
+            w!("取消"),
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+            358,
+            400,
+            88,
+            30,
+            Some(hwnd),
+            Some(HMENU(ID_CANCEL as *mut core::ffi::c_void)),
+            Some(hinstance),
+            None,
+        )
+        .unwrap_or_default();
+
+        let font = GetStockObject(DEFAULT_GUI_FONT);
+        for control in [label_w, list, ok, cancel] {
+            SendMessageW(
+                control,
+                WM_SETFONT,
+                Some(WPARAM(font.0 as usize)),
+                Some(LPARAM(1)),
+            );
+        }
+
+        center_on_parent(hwnd, parent);
+        let _ = EnableWindow(parent, false);
+        let _ = SetForegroundWindow(hwnd);
+
+        let mut msg = MSG::default();
+        while IsWindow(Some(hwnd)).as_bool() {
+            let ret = GetMessageW(&mut msg, None, 0, 0);
+            if ret.0 <= 0 {
+                break;
+            }
+            if msg.hwnd == list && msg.message == WM_KEYDOWN {
+                let vk = msg.wParam.0 as u32;
+                if vk == VK_RETURN.0 as u32 {
+                    finish_select(hwnd, true);
+                    continue;
+                }
+                if vk == VK_ESCAPE.0 as u32 {
+                    finish_select(hwnd, false);
+                    continue;
+                }
+            }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+
+        let _ = EnableWindow(parent, true);
+        let _ = SetForegroundWindow(parent);
+    }
+
+    SELECT_RESULT.with(|slot| slot.borrow_mut().take())
+}
+
+fn finish_select(hwnd: HWND, ok: bool) {
+    unsafe {
+        if ok {
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SelectState;
+            if let Some(state) = ptr.as_ref() {
+                let index =
+                    SendMessageW(state.list, LB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0;
+                if index >= 0 {
+                    let len = SendMessageW(
+                        state.list,
+                        LB_GETTEXTLEN,
+                        Some(WPARAM(index as usize)),
+                        Some(LPARAM(0)),
+                    )
+                    .0;
+                    if len >= 0 {
+                        let mut buf = vec![0u16; len as usize + 1];
+                        SendMessageW(
+                            state.list,
+                            LB_GETTEXT,
+                            Some(WPARAM(index as usize)),
+                            Some(LPARAM(buf.as_mut_ptr() as isize)),
+                        );
+                        let text = String::from_utf16_lossy(&buf[..len as usize]);
+                        SELECT_RESULT.with(|slot| *slot.borrow_mut() = Some(text));
+                    }
+                }
+            }
+        }
+        let _ = DestroyWindow(hwnd);
+    }
+}
+
+unsafe extern "system" fn select_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_NCCREATE => {
+                let cs = &*(lparam.0 as *const CREATESTRUCTW);
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
+                LRESULT(1)
+            }
+            WM_COMMAND => {
+                let id = wparam.0 & 0xFFFF;
+                let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
+                if id == ID_OK {
+                    finish_select(hwnd, true);
+                } else if id == ID_CANCEL {
+                    finish_select(hwnd, false);
+                } else if code == LBN_DBLCLK {
+                    finish_select(hwnd, true);
+                }
+                LRESULT(0)
+            }
+            WM_CLOSE => {
+                let _ = DestroyWindow(hwnd);
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SelectState;
+                if !ptr.is_null() {
+                    drop(Box::from_raw(ptr));
+                }
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
     }
 }
 

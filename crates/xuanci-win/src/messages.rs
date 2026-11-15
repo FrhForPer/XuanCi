@@ -9,6 +9,7 @@ pub const WM_XUANCI_CAPTURED: u32 = WM_APP + 13;
 pub const WM_XUANCI_CAPTURE_FAILED: u32 = WM_APP + 14;
 pub const WM_XUANCI_RESULT_CHUNK: u32 = WM_APP + 20;
 pub const WM_XUANCI_RESULT_DONE: u32 = WM_APP + 21;
+pub const WM_XUANCI_MODELS_READY: u32 = WM_APP + 22;
 
 pub const MOUSE_DOWN: usize = 1;
 pub const MOUSE_UP: usize = 2;

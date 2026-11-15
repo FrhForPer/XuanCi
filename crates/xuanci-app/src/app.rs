@@ -1,27 +1,29 @@
 //! Application bootstrap, main message loop and UI wiring.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use windows::core::w;
+use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, DispatchMessageW, GetCursorPos, GetMessageW,
-    PostMessageW, PostQuitMessage, SetForegroundWindow, TrackPopupMenu, TranslateMessage, MSG,
-    MENU_ITEM_FLAGS, MF_CHECKED, MF_STRING, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, WM_COMMAND,
-    WM_DESTROY, WM_HOTKEY,
+    PostMessageW, PostQuitMessage, SetForegroundWindow, TrackPopupMenu, TranslateMessage,
+    MENU_ITEM_FLAGS, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, TPM_BOTTOMALIGN,
+    TPM_RIGHTBUTTON, WM_COMMAND, WM_DESTROY, WM_HOTKEY,
 };
 
 use xuanci_core::ai::ChatRequest;
 use xuanci_core::prompt;
 use xuanci_core::selection::SelectionContext;
-use xuanci_core::settings::AppSettings;
+use xuanci_core::settings::{detect_provider, AppSettings, ProviderProfile};
 use xuanci_core::templates::PromptTemplate;
 use xuanci_win::dialog::{self, InputSpec};
 use xuanci_win::messages::{
     self, MOUSE_DOWN, MOUSE_OTHER_BUTTON, MOUSE_UP, MOUSE_WHEEL, WM_XUANCI_ACTION,
-    WM_XUANCI_CAPTURED, WM_XUANCI_CAPTURE_FAILED, WM_XUANCI_FOREGROUND, WM_XUANCI_MOUSE,
+    WM_XUANCI_CAPTURED, WM_XUANCI_CAPTURE_FAILED, WM_XUANCI_FOREGROUND, WM_XUANCI_MODELS_READY,
+    WM_XUANCI_MOUSE,
 };
 use xuanci_win::{foreground, hooks, hotkey, result, toolbar, tray, window};
 
@@ -39,10 +41,13 @@ const HOTKEY_CLIPBOARD_TEST_ID: i32 = 0x10F1;
 const MENU_TEST_CAPTURE: usize = 1;
 const MENU_EXIT: usize = 2;
 const MENU_SET_KEY: usize = 3;
-const MENU_SET_MODEL: usize = 4;
-const MENU_SET_BASE_URL: usize = 5;
 const MENU_AUTOSTART: usize = 6;
 const MENU_AUTO_FALLBACK: usize = 7;
+const MENU_PROVIDER_ADD: usize = 10;
+const MENU_PROVIDER_EDIT: usize = 11;
+const MENU_PROVIDER_DELETE: usize = 12;
+const MENU_FETCH_MODELS: usize = 13;
+const MENU_PROVIDER_BASE: usize = 200;
 
 const ACTION_TRANSLATE: usize = 0;
 const ACTION_ASK_AI: usize = 1;
@@ -51,10 +56,12 @@ const ACTION_ASK_QUICK: usize = 2;
 
 static APP_HWND: AtomicIsize = AtomicIsize::new(0);
 static TOOLBAR_HWND: AtomicIsize = AtomicIsize::new(0);
-static TEMPLATES: OnceLock<Mutex<Vec<PromptTemplate>>> = OnceLock::new();
 static LAST_SELECTION: Mutex<Option<SelectionContext>> = Mutex::new(None);
 static MOUSE_DOWN_AT: Mutex<Option<(i32, i32, Instant)>> = Mutex::new(None);
 static LAST_CLICK: Mutex<Option<(i32, i32, Instant)>> = Mutex::new(None);
+static TEMPLATES: OnceLock<Mutex<Vec<PromptTemplate>>> = OnceLock::new();
+static API_KEYS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static MODELS_RESULT: Mutex<Option<(String, Result<Vec<String>, String>)>> = Mutex::new(None);
 
 const DRAG_THRESHOLD_PX: i32 = 8;
 const DRAG_MIN_MS: u128 = 60;
@@ -96,11 +103,23 @@ fn settings_snapshot() -> AppSettings {
         .unwrap_or_default()
 }
 
-fn api_key_cell() -> &'static Mutex<Option<String>> {
-    static CELL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-    CELL.get_or_init(|| {
-        let stored = storage::load_api_key().or_else(debug_api_key);
-        Mutex::new(stored)
+fn save_settings_cell(settings: &AppSettings) -> Result<(), String> {
+    if let Ok(mut cell) = settings_cell().lock() {
+        *cell = settings.clone();
+    }
+    storage::save_settings(settings)
+}
+
+fn api_keys_cell() -> &'static Mutex<HashMap<String, String>> {
+    API_KEYS.get_or_init(|| {
+        let settings = settings_snapshot();
+        let mut keys = storage::load_api_keys(&settings);
+        if !keys.contains_key(&settings.active_provider) {
+            if let Some(key) = debug_api_key() {
+                keys.insert(settings.active_provider.clone(), key);
+            }
+        }
+        Mutex::new(keys)
     })
 }
 
@@ -116,8 +135,31 @@ fn debug_api_key() -> Option<String> {
     None
 }
 
-fn api_key_snapshot() -> Option<String> {
-    api_key_cell().lock().ok().and_then(|guard| guard.clone())
+fn active_api_key() -> Option<String> {
+    let settings = settings_snapshot();
+    key_for(&settings.active_provider)
+}
+
+fn key_for(provider_id: &str) -> Option<String> {
+    api_keys_cell()
+        .lock()
+        .ok()
+        .and_then(|keys| keys.get(provider_id).cloned())
+}
+
+fn set_key_for(provider_id: &str, key: &str) -> Result<(), String> {
+    let mut keys = api_keys_cell()
+        .lock()
+        .map_err(|_| "密钥表锁失败".to_string())?;
+    keys.insert(provider_id.to_string(), key.to_string());
+    storage::save_api_keys(&keys)
+}
+
+fn remove_key_for(provider_id: &str) {
+    if let Ok(mut keys) = api_keys_cell().lock() {
+        keys.remove(provider_id);
+        let _ = storage::save_api_keys(&keys);
+    }
 }
 
 fn templates_cell() -> &'static Mutex<Vec<PromptTemplate>> {
@@ -135,12 +177,20 @@ fn take_selection() -> Option<SelectionContext> {
     LAST_SELECTION.lock().ok().and_then(|mut slot| slot.take())
 }
 
+fn base_url_allowed(url: &str) -> bool {
+    url.starts_with("https://")
+        || url.starts_with("http://127.0.0.1")
+        || url.starts_with("http://localhost")
+}
+
 pub fn run() -> Result<(), String> {
     let _ = settings_cell();
-    let _ = api_key_cell();
+    let _ = api_keys_cell();
     debug_log(&format!(
-        "config loaded key={} endpoint={}",
-        api_key_snapshot().is_some(),
+        "config loaded providers={} active={} key={} endpoint={}",
+        settings_snapshot().providers.len(),
+        settings_snapshot().active_name(),
+        active_api_key().is_some(),
         settings_snapshot().endpoint()
     ));
 
@@ -153,7 +203,6 @@ pub fn run() -> Result<(), String> {
     let toolbar_hwnd = toolbar::create(window.hwnd, &labels)?;
     TOOLBAR_HWND.store(toolbar_hwnd.0 as isize, Ordering::SeqCst);
     debug_log(&format!("toolbar created with {} actions", labels.len()));
-    debug_log("toolbar created");
 
     hooks::install(window.hwnd)?;
     debug_log("mouse hook installed");
@@ -176,7 +225,7 @@ pub fn run() -> Result<(), String> {
     }
 
     let autostart = std::env::args().any(|arg| arg == "--autostart");
-    if !autostart && api_key_snapshot().is_none() {
+    if !autostart && active_api_key().is_none() {
         prompt_api_key(window.hwnd);
     }
 
@@ -236,17 +285,24 @@ unsafe extern "system" fn main_wndproc(
                 LRESULT(0)
             }
             WM_COMMAND => {
-                match wparam.0 & 0xFFFF {
-                    MENU_TEST_CAPTURE => spawn_hotkey_capture(ACTION_TRANSLATE),
-                    MENU_EXIT => {
-                        let _ = destroy_window_safe(hwnd);
+                let id = wparam.0 & 0xFFFF;
+                if id >= MENU_PROVIDER_BASE {
+                    switch_provider(id - MENU_PROVIDER_BASE);
+                } else {
+                    match id {
+                        MENU_TEST_CAPTURE => spawn_hotkey_capture(ACTION_TRANSLATE),
+                        MENU_EXIT => {
+                            let _ = destroy_window_safe(hwnd);
+                        }
+                        MENU_SET_KEY => prompt_api_key(hwnd),
+                        MENU_AUTOSTART => toggle_autostart(),
+                        MENU_AUTO_FALLBACK => toggle_auto_fallback(),
+                        MENU_PROVIDER_ADD => add_provider(hwnd),
+                        MENU_PROVIDER_EDIT => edit_active_provider(hwnd),
+                        MENU_PROVIDER_DELETE => delete_active_provider(hwnd),
+                        MENU_FETCH_MODELS => fetch_models(),
+                        _ => {}
                     }
-                    MENU_SET_KEY => prompt_api_key(hwnd),
-                    MENU_SET_MODEL => prompt_model(hwnd),
-                    MENU_SET_BASE_URL => prompt_base_url(hwnd),
-                    MENU_AUTOSTART => toggle_autostart(),
-                    MENU_AUTO_FALLBACK => toggle_auto_fallback(),
-                    _ => {}
                 }
                 LRESULT(0)
             }
@@ -268,6 +324,10 @@ unsafe extern "system" fn main_wndproc(
             WM_XUANCI_CAPTURE_FAILED => LRESULT(0),
             WM_XUANCI_ACTION => {
                 run_action(wparam.0);
+                LRESULT(0)
+            }
+            WM_XUANCI_MODELS_READY => {
+                handle_models_ready();
                 LRESULT(0)
             }
             WM_DESTROY => {
@@ -321,8 +381,6 @@ fn handle_mouse(wparam: WPARAM, lparam: LPARAM) {
                 return;
             }
 
-            // Double-click (word selection) does not move the pointer, so treat
-            // a second quick click in the same spot as a selection gesture.
             let previous = LAST_CLICK.lock().ok().and_then(|mut slot| slot.take());
             let is_double_click = previous.map_or(false, |(px, py, at)| {
                 let ddx = x - px;
@@ -369,9 +427,10 @@ fn run_action(index: usize) {
         return;
     };
     debug_log(&format!(
-        "action {index}: chars={} key={}",
+        "action {index}: chars={} provider={} key={}",
         ctx.text.chars().count(),
-        api_key_snapshot().is_some()
+        settings_snapshot().active_name(),
+        active_api_key().is_some()
     ));
 
     match index {
@@ -399,19 +458,9 @@ fn run_action(index: usize) {
     }
 }
 
-fn start_template(ctx: SelectionContext, template: PromptTemplate) {
-    let Some(api_key) = api_key_snapshot() else {
-        dialog::info("请先在托盘菜单中设置 DeepSeek API Key。");
-        return;
-    };
-    let settings = settings_snapshot();
-    let request = template.to_request(&settings, &ctx.text);
-    launch_result(&template.name, settings, api_key, request);
-}
-
 fn start_translate(ctx: SelectionContext) {
-    let Some(api_key) = api_key_snapshot() else {
-        dialog::info("请先在托盘菜单中设置 DeepSeek API Key。");
+    let Some(api_key) = active_api_key() else {
+        prompt_key_or_info();
         return;
     };
     let settings = settings_snapshot();
@@ -420,8 +469,8 @@ fn start_translate(ctx: SelectionContext) {
 }
 
 fn start_ask(ctx: SelectionContext, question: String) {
-    let Some(api_key) = api_key_snapshot() else {
-        dialog::info("请先在托盘菜单中设置 DeepSeek API Key。");
+    let Some(api_key) = active_api_key() else {
+        prompt_key_or_info();
         return;
     };
     let settings = settings_snapshot();
@@ -429,8 +478,29 @@ fn start_ask(ctx: SelectionContext, question: String) {
     launch_result("AI 问答", settings, api_key, request);
 }
 
+fn start_template(ctx: SelectionContext, template: PromptTemplate) {
+    let Some(api_key) = active_api_key() else {
+        prompt_key_or_info();
+        return;
+    };
+    let settings = settings_snapshot();
+    let request = template.to_request(&settings, &ctx.text);
+    launch_result(&template.name, settings, api_key, request);
+}
+
+fn prompt_key_or_info() {
+    let name = settings_snapshot().active_name();
+    dialog::info(&format!(
+        "当前服务商「{name}」还没有 API Key。\n请在托盘菜单中设置当前 API Key。"
+    ));
+}
+
 fn launch_result(title: &str, settings: AppSettings, api_key: String, request: ChatRequest) {
-    debug_log(&format!("launch_result endpoint={}", settings.endpoint()));
+    debug_log(&format!(
+        "launch_result provider={} endpoint={}",
+        settings.active_name(),
+        settings.endpoint()
+    ));
     match result::open(app_hwnd(), title) {
         Ok(hwnd) => {
             debug_log("result window opened");
@@ -503,7 +573,6 @@ fn spawn_hotkey_capture(action: usize) {
                     if let Ok(mut slot) = LAST_SELECTION.lock() {
                         *slot = Some(ctx);
                     }
-                    debug_log(&format!("posting action {action}"));
                     post_to_app_action(action);
                 }
                 Err(e) => {
@@ -534,9 +603,12 @@ fn post_to_app_action(index: usize) {
 }
 
 fn prompt_api_key(parent: HWND) {
+    let settings = settings_snapshot();
+    let name = settings.active_name();
+    let label = format!("{name} 的 API Key（DPAPI 加密保存在本机）");
     let spec = InputSpec {
         title: "XuanCi 设置",
-        label: "DeepSeek API Key（用 Windows DPAPI 加密保存在本机）",
+        label: &label,
         initial: "",
         password: true,
         multiline: false,
@@ -548,23 +620,56 @@ fn prompt_api_key(parent: HWND) {
     if key.is_empty() {
         return;
     }
-    match storage::save_api_key(&key) {
-        Ok(()) => {
-            if let Ok(mut slot) = api_key_cell().lock() {
-                *slot = Some(key);
-            }
-            dialog::info("API Key 已加密保存。");
-        }
+    match set_key_for(&settings.active_provider, &key) {
+        Ok(()) => dialog::info(&format!("已保存「{name}」的 API Key。")),
         Err(e) => dialog::error(&format!("保存 API Key 失败：{e}")),
     }
 }
 
-fn prompt_model(parent: HWND) {
-    let current = settings_snapshot();
+fn switch_provider(index: usize) {
+    let mut settings = settings_snapshot();
+    let Some(profile) = settings.providers.get(index).cloned() else {
+        return;
+    };
+    if !settings.switch_provider(&profile.id) {
+        return;
+    }
+    if let Err(e) = save_settings_cell(&settings) {
+        dialog::error(&format!("保存设置失败：{e}"));
+        return;
+    }
+    if key_for(&profile.id).is_none() {
+        dialog::info(&format!(
+            "已切换到「{}」。\n该服务商还没有保存 API Key，请通过「设置当前 API Key…」配置。",
+            profile.name
+        ));
+    }
+}
+
+fn add_provider(parent: HWND) {
     let spec = InputSpec {
-        title: "XuanCi 设置",
-        label: "模型名称（DeepSeek 兼容接口）",
-        initial: &current.model,
+        title: "添加服务商",
+        label: "Base URL（例如 https://api.openai.com/v1）",
+        initial: "https://api.openai.com/v1",
+        password: false,
+        multiline: false,
+    };
+    let Some(base) = dialog::input_text(parent, spec) else {
+        return;
+    };
+    let base = base.trim().trim_end_matches('/').to_string();
+    if base.is_empty() || !base_url_allowed(&base) {
+        dialog::error("Base URL 必须以 https:// 开头（本地 127.0.0.1/localhost 除外）。");
+        return;
+    }
+
+    let (id_hint, name_hint, model_hint) = detect_provider(&base);
+
+    let model_initial = model_hint.to_string();
+    let spec = InputSpec {
+        title: "添加服务商",
+        label: "模型名（可稍后用「获取模型列表」修改）",
+        initial: &model_initial,
         password: false,
         multiline: false,
     };
@@ -573,44 +678,336 @@ fn prompt_model(parent: HWND) {
     };
     let model = model.trim().to_string();
     if model.is_empty() {
+        dialog::error("模型名不能为空。");
         return;
     }
-    if let Ok(mut settings) = settings_cell().lock() {
-        settings.model = model;
-        if let Err(e) = storage::save_settings(&settings) {
-            dialog::error(&format!("保存设置失败：{e}"));
-        }
-    }
-}
 
-fn prompt_base_url(parent: HWND) {
-    let current = settings_snapshot();
+    let name_initial = name_hint.to_string();
     let spec = InputSpec {
-        title: "XuanCi 设置",
-        label: "接口 Base URL（必须为 HTTPS；本地测试可用 http://127.0.0.1）",
-        initial: &current.base_url,
+        title: "添加服务商",
+        label: "显示名称",
+        initial: &name_initial,
         password: false,
         multiline: false,
     };
-    let Some(url) = dialog::input_text(parent, spec) else {
+    let Some(name) = dialog::input_text(parent, spec) else {
         return;
     };
-    let url = url.trim().trim_end_matches('/').to_string();
-    if url.is_empty() {
+    let name = name.trim().to_string();
+    let name = if name.is_empty() {
+        name_hint.to_string()
+    } else {
+        name
+    };
+
+    let spec = InputSpec {
+        title: "添加服务商",
+        label: "API Key（本地模型可填 local）",
+        initial: "",
+        password: true,
+        multiline: false,
+    };
+    let Some(key) = dialog::input_text(parent, spec) else {
         return;
-    }
-    if !(url.starts_with("https://")
-        || url.starts_with("http://127.0.0.1")
-        || url.starts_with("http://localhost"))
-    {
-        dialog::error("Base URL 必须以 https:// 开头（本地测试地址除外）。");
-        return;
-    }
-    if let Ok(mut settings) = settings_cell().lock() {
-        settings.base_url = url;
-        if let Err(e) = storage::save_settings(&settings) {
-            dialog::error(&format!("保存设置失败：{e}"));
+    };
+    let mut key = key.trim().to_string();
+    if key.is_empty() {
+        if base.contains("127.0.0.1") || base.contains("localhost") {
+            key = "local".to_string();
+        } else {
+            dialog::error("API Key 不能为空。");
+            return;
         }
+    }
+
+    let settings = settings_snapshot();
+    let mut id = id_hint.to_string();
+    let mut suffix = 2;
+    while settings.providers.iter().any(|provider| provider.id == id) {
+        id = format!("{id_hint}-{suffix}");
+        suffix += 1;
+    }
+
+    let profile = ProviderProfile {
+        id: id.clone(),
+        name: name.clone(),
+        base_url: base,
+        model,
+    };
+
+    let mut settings = settings;
+    settings.upsert_provider(profile);
+    settings.active_provider = id.clone();
+    settings.sync_active();
+    if let Err(e) = save_settings_cell(&settings) {
+        dialog::error(&format!("保存设置失败：{e}"));
+        return;
+    }
+    if let Err(e) = set_key_for(&id, &key) {
+        dialog::error(&format!("添加成功，但保存 API Key 失败：{e}"));
+        return;
+    }
+    dialog::info(&format!("已添加并切换到服务商「{name}」。"));
+}
+
+fn edit_active_provider(parent: HWND) {
+    let settings = settings_snapshot();
+    let Some(profile) = settings.active().cloned() else {
+        return;
+    };
+
+    let spec = InputSpec {
+        title: "编辑服务商",
+        label: "显示名称",
+        initial: &profile.name,
+        password: false,
+        multiline: false,
+    };
+    let Some(name) = dialog::input_text(parent, spec) else {
+        return;
+    };
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        dialog::error("显示名称不能为空。");
+        return;
+    }
+
+    let spec = InputSpec {
+        title: "编辑服务商",
+        label: "Base URL",
+        initial: &profile.base_url,
+        password: false,
+        multiline: false,
+    };
+    let Some(base) = dialog::input_text(parent, spec) else {
+        return;
+    };
+    let base = base.trim().trim_end_matches('/').to_string();
+    if !base_url_allowed(&base) {
+        dialog::error("Base URL 必须以 https:// 开头（本地地址除外）。");
+        return;
+    }
+
+    let spec = InputSpec {
+        title: "编辑服务商",
+        label: "模型名",
+        initial: &profile.model,
+        password: false,
+        multiline: false,
+    };
+    let Some(model) = dialog::input_text(parent, spec) else {
+        return;
+    };
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        dialog::error("模型名不能为空。");
+        return;
+    }
+
+    let mut settings = settings;
+    settings.upsert_provider(ProviderProfile {
+        id: profile.id.clone(),
+        name,
+        base_url: base,
+        model,
+    });
+    settings.active_provider = profile.id;
+    settings.sync_active();
+    if let Err(e) = save_settings_cell(&settings) {
+        dialog::error(&format!("保存设置失败：{e}"));
+    }
+}
+
+fn delete_active_provider(parent: HWND) {
+    let _ = parent;
+    let settings = settings_snapshot();
+    let Some(profile) = settings.active().cloned() else {
+        return;
+    };
+    if !dialog::confirm(&format!(
+        "确定删除服务商「{}」吗？\n它的 API Key 也会被删除。",
+        profile.name
+    )) {
+        return;
+    }
+
+    let mut settings = settings;
+    if !settings.remove_provider(&profile.id) {
+        dialog::error("至少需要保留一个服务商。");
+        return;
+    }
+    if let Err(e) = save_settings_cell(&settings) {
+        dialog::error(&format!("保存设置失败：{e}"));
+        return;
+    }
+    remove_key_for(&profile.id);
+    dialog::info(&format!("已删除服务商「{}」。", profile.name));
+}
+
+fn fetch_models() {
+    let settings = settings_snapshot();
+    let Some(api_key) = key_for(&settings.active_provider) else {
+        prompt_key_or_info();
+        return;
+    };
+    let provider_id = settings.active_provider.clone();
+    std::thread::Builder::new()
+        .name("xuanci-models".into())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let result = xuanci_core::deepseek::list_models(&settings, &api_key);
+            if let Ok(mut slot) = MODELS_RESULT.lock() {
+                *slot = Some((provider_id, result));
+            }
+            post_to_app(WM_XUANCI_MODELS_READY);
+        })
+        .ok();
+}
+
+fn handle_models_ready() {
+    let result = MODELS_RESULT.lock().ok().and_then(|mut slot| slot.take());
+    let Some((provider_id, result)) = result else {
+        return;
+    };
+    match result {
+        Ok(models) => {
+            let settings = settings_snapshot();
+            let name = settings
+                .providers
+                .iter()
+                .find(|provider| provider.id == provider_id)
+                .map(|provider| provider.name.clone())
+                .unwrap_or_else(|| "当前服务商".to_string());
+            let label = format!("{name} 可用的模型（共 {} 个）", models.len());
+            let Some(model) = dialog::select_item(app_hwnd(), "选择模型", &label, &models) else {
+                return;
+            };
+            let mut settings = settings;
+            if let Some(provider) = settings
+                .providers
+                .iter_mut()
+                .find(|provider| provider.id == provider_id)
+            {
+                provider.model = model.clone();
+            }
+            if settings.active_provider == provider_id {
+                settings.sync_active();
+            }
+            match save_settings_cell(&settings) {
+                Ok(()) => dialog::info(&format!("模型已设置为：{model}")),
+                Err(e) => dialog::error(&format!("保存设置失败：{e}")),
+            }
+        }
+        Err(e) => dialog::error(&format!("获取模型列表失败：{e}")),
+    }
+}
+
+fn toggle_auto_fallback() {
+    let mut settings = settings_snapshot();
+    settings.clipboard_fallback_auto = !settings.clipboard_fallback_auto;
+    if let Err(e) = save_settings_cell(&settings) {
+        dialog::error(&format!("保存设置失败：{e}"));
+    }
+}
+
+fn toggle_autostart() {
+    let enable = !autostart::is_enabled();
+    match autostart::set_enabled(enable) {
+        Ok(()) => {
+            if enable {
+                dialog::info("已开启开机自启。\n下次登录 Windows 时会自动运行 XuanCi。");
+            } else {
+                dialog::info("已关闭开机自启。");
+            }
+        }
+        Err(e) => dialog::error(&format!("设置开机自启失败：{e}")),
+    }
+}
+
+unsafe fn show_tray_menu(hwnd: HWND) {
+    unsafe {
+        let settings = settings_snapshot();
+        let Ok(menu) = CreatePopupMenu() else {
+            return;
+        };
+        let Ok(submenu) = CreatePopupMenu() else {
+            let _ = DestroyMenu(menu);
+            return;
+        };
+
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_TEST_CAPTURE,
+            w!("取词并翻译\tCtrl+Alt+D"),
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+
+        for (index, provider) in settings.providers.iter().enumerate() {
+            let flags = if provider.id == settings.active_provider {
+                MENU_ITEM_FLAGS(MF_STRING.0 | MF_CHECKED.0)
+            } else {
+                MF_STRING
+            };
+            let label = HSTRING::from(format!("{} · {}", provider.name, provider.model));
+            let _ = AppendMenuW(
+                submenu,
+                flags,
+                MENU_PROVIDER_BASE + index,
+                PCWSTR(label.as_ptr()),
+            );
+        }
+        let _ = AppendMenuW(submenu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(submenu, MF_STRING, MENU_PROVIDER_ADD, w!("添加服务商…"));
+        let _ = AppendMenuW(submenu, MF_STRING, MENU_PROVIDER_EDIT, w!("编辑当前服务商…"));
+        let _ = AppendMenuW(submenu, MF_STRING, MENU_PROVIDER_DELETE, w!("删除当前服务商"));
+
+        let sub_label = HSTRING::from(format!("服务商：{}", settings.active_name()));
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            submenu.0 as usize,
+            PCWSTR(sub_label.as_ptr()),
+        );
+        let _ = AppendMenuW(menu, MF_STRING, MENU_FETCH_MODELS, w!("获取模型列表…"));
+        let _ = AppendMenuW(menu, MF_STRING, MENU_SET_KEY, w!("设置当前 API Key…"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+
+        let autostart_flags = if autostart::is_enabled() {
+            MENU_ITEM_FLAGS(MF_STRING.0 | MF_CHECKED.0)
+        } else {
+            MF_STRING
+        };
+        let _ = AppendMenuW(menu, autostart_flags, MENU_AUTOSTART, w!("开机自启"));
+
+        let fallback_flags = if settings.clipboard_fallback_auto {
+            MENU_ITEM_FLAGS(MF_STRING.0 | MF_CHECKED.0)
+        } else {
+            MF_STRING
+        };
+        let _ = AppendMenuW(
+            menu,
+            fallback_flags,
+            MENU_AUTO_FALLBACK,
+            w!("自动弹条使用剪贴板回退"),
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("退出"));
+
+        let mut pt = Default::default();
+        let _ = GetCursorPos(&mut pt);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = TrackPopupMenu(
+            menu,
+            TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
+            pt.x,
+            pt.y,
+            None,
+            hwnd,
+            None,
+        );
+        let _ = DestroyMenu(submenu);
+        let _ = DestroyMenu(menu);
     }
 }
 
@@ -638,78 +1035,6 @@ fn spawn_clipboard_test() {
             }
         })
         .ok();
-}
-
-fn toggle_auto_fallback() {
-    let mut settings = settings_snapshot();
-    settings.clipboard_fallback_auto = !settings.clipboard_fallback_auto;
-    if let Ok(mut cell) = settings_cell().lock() {
-        *cell = settings.clone();
-    }
-    if let Err(e) = storage::save_settings(&settings) {
-        dialog::error(&format!("保存设置失败：{e}"));
-    }
-}
-
-fn toggle_autostart() {
-    let enable = !autostart::is_enabled();
-    match autostart::set_enabled(enable) {
-        Ok(()) => {
-            if enable {
-                dialog::info("已开启开机自启。\n下次登录 Windows 时会自动运行 XuanCi。");
-            } else {
-                dialog::info("已关闭开机自启。");
-            }
-        }
-        Err(e) => dialog::error(&format!("设置开机自启失败：{e}")),
-    }
-}
-
-unsafe fn show_tray_menu(hwnd: HWND) {
-    unsafe {
-        if let Ok(menu) = CreatePopupMenu() {
-            let _ = AppendMenuW(
-                menu,
-                MF_STRING,
-                MENU_TEST_CAPTURE,
-                w!("取词并翻译\tCtrl+Alt+D"),
-            );
-            let autostart_flags = if autostart::is_enabled() {
-                MENU_ITEM_FLAGS(MF_STRING.0 | MF_CHECKED.0)
-            } else {
-                MF_STRING
-            };
-            let _ = AppendMenuW(menu, autostart_flags, MENU_AUTOSTART, w!("开机自启"));
-            let fallback_flags = if settings_snapshot().clipboard_fallback_auto {
-                MENU_ITEM_FLAGS(MF_STRING.0 | MF_CHECKED.0)
-            } else {
-                MF_STRING
-            };
-            let _ = AppendMenuW(
-                menu,
-                fallback_flags,
-                MENU_AUTO_FALLBACK,
-                w!("自动弹条使用剪贴板回退"),
-            );
-            let _ = AppendMenuW(menu, MF_STRING, MENU_SET_KEY, w!("设置 API Key…"));
-            let _ = AppendMenuW(menu, MF_STRING, MENU_SET_MODEL, w!("设置模型…"));
-            let _ = AppendMenuW(menu, MF_STRING, MENU_SET_BASE_URL, w!("设置 Base URL…"));
-            let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("退出"));
-            let mut pt = Default::default();
-            let _ = GetCursorPos(&mut pt);
-            let _ = SetForegroundWindow(hwnd);
-            let _ = TrackPopupMenu(
-                menu,
-                TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
-                pt.x,
-                pt.y,
-                None,
-                hwnd,
-                None,
-            );
-            let _ = DestroyMenu(menu);
-        }
-    }
 }
 
 /// Debug-only log: records outcome metadata, never selected text.
