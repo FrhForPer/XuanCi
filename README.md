@@ -6,14 +6,14 @@ Windows 全局划词工具：在任意软件中选中文字，自动弹出小工
 - 兼容任意 OpenAI 格式接口（DeepSeek、OpenAI、硅基流动、通义、智谱、Moonshot、Ollama、LM Studio 等），SSE 流式输出
 - 多服务商配置：根据 Base URL 自动识别服务商，每个服务商独立保存地址、模型和 Key，托盘一键切换
 - API Key 使用 Windows DPAPI 加密保存在本机
-- 声明式提示词模板，改 JSON 即可扩展动作
+- 声明式提示词模板：可在托盘直接增删动作，也可编辑 JSON 扩展
 
 ## 已实现
 
 | 能力 | 说明 |
 |---|---|
 | 划词自动弹条 | 鼠标拖选或双击选词后，在光标附近弹出「翻译 / AI 问答 / 自定义模板」 |
-| 全局快捷键 | `Ctrl+Alt+D` 翻译，`Ctrl+Alt+Q` 让 AI 解释（v1 固定，占用时会提示） |
+| 全局快捷键 | `Ctrl+Alt+D` 翻译，`Ctrl+Alt+Q` 让 AI 解释（当前版本固定，占用时会提示） |
 | 取词 | UI Automation 优先；UIA 失败时用 Ctrl+C 剪贴板回退并恢复原剪贴板（热键与自动弹条均可，可在托盘关闭） |
 | 安全策略 | 密码框拒绝、管理员程序提示、终端禁用 Ctrl+C、文件/图片剪贴板回退保护 |
 | 流式结果窗 | 可滚动、复制纯文本、复制 Markdown、停止、关闭 |
@@ -61,7 +61,7 @@ cargo build --release
 | 文件 | 内容 |
 |---|---|
 | `secrets.bin` | DPAPI 加密的「服务商 ID → API Key」映射；旧版单 Key 文件会自动迁移 |
-| `settings.json` | 服务商列表、当前服务商、翻译目标语言、剪贴板回退开关、Markdown 渲染开关、LaTeX 插件开关（默认模型 `deepseek-flash`，官方另可选 `deepseek-v4-pro`） |
+| `settings.json` | 服务商列表、当前服务商、翻译目标语言、自动弹条与剪贴板回退开关、Markdown 渲染与代码高亮开关、LaTeX 插件开关（默认模型 `deepseek-flash`，官方另可选 `deepseek-v4-pro`） |
 | `templates.json` | 提示词模板（见下） |
 
 `settings.json` 中的服务商结构：
@@ -133,15 +133,22 @@ cargo build --release --manifest-path plugins/latex/Cargo.toml
 - 链接以蓝色下划线显示并附带 URL，当前版本不是可点击链接
 - LaTeX 插件是独立进程，只有用户手动安装后才会运行；官方插件只读取请求中的公式文本并返回文本片段，不访问网络、不写文件
 
-## 已知限制（v1）
+## 资源占用（本机实测）
+
+- 空闲私有内存约 5–6 MB，工作集约 28–36 MB（工作集包含共享系统 DLL 页面）
+- 空闲 CPU 接近 0，不发起网络请求
+- 代码块语法高亮首次加载约增加 8 MB 私有内存；可在托盘关闭，关闭后若本次运行已加载过高亮数据，重启后才会释放
+
+## 已知限制
 
 - LaTeX 公式默认显示源码；安装可选插件后会转换为易读文本
 - 公式为近似文本排版（分式用括号表示、上下标用 RichEdit 上下标），不追求与 LaTeX 完全一致的视觉效果
 - Markdown 中的图片不显示，只保留 `[图片: alt]` 占位
 - 任务列表的复选框是静态符号，不能点击切换
 - 表格只支持 GFM 基本表格，复杂嵌套表格可能显示不理想
+- 快捷键当前固定，暂不支持在界面中修改
 - 未实现安装包
-- 未实现外部插件运行时（当前扩展方式为 JSON 模板）
+- 未实现通用外部插件运行时（当前扩展方式是 JSON 模板和独立进程 LaTeX 插件）
 - 不支持 OCR/截图取词、触控/触控笔划词
 - 管理员权限程序、部分 Qt/Java/游戏窗口无法取词
 - 未做代码签名，个别杀毒软件可能对全局钩子告警
@@ -154,9 +161,10 @@ cargo build --release --manifest-path plugins/latex/Cargo.toml
 ## 目录
 
 ```
-crates/xuanci-core/   # 纯逻辑：模型、提示词、模板、DeepSeek SSE
+crates/xuanci-core/   # 纯逻辑：模型、提示词、模板、Markdown/LaTeX 转换、DeepSeek SSE
 crates/xuanci-win/    # Win32：UIA、剪贴板、钩子、热键、工具条、结果窗、DPAPI
 crates/xuanci-app/    # 启动、消息循环、动作编排、存储
+plugins/latex/        # 可选 LaTeX 公式插件（独立构建，默认不安装）
 tools/mock_sse.py     # 本地 SSE mock，用于端到端测试
 docs/plugin-spec.md   # 扩展机制与未来 WASM 插件规范
 ```
