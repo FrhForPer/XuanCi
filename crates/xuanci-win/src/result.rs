@@ -250,6 +250,7 @@ pub fn start_stream(
     let state = state(hwnd).ok_or_else(|| "结果窗口状态丢失".to_string())?;
 
     let render_markdown = settings.markdown_render;
+    let code_highlight = settings.code_highlight;
 
     let mut shared = state.shared.lock().map_err(|_| "状态锁失败".to_string())?;
     shared.pending.clear();
@@ -304,7 +305,7 @@ pub fn start_stream(
                         if !full.is_empty() {
                             let rendered = std::panic::catch_unwind(
                                 std::panic::AssertUnwindSafe(|| {
-                                    let options = RenderOptions::default();
+                                    let options = RenderOptions { code_highlight };
                                     match latex_plugin.clone() {
                                         Some(path) => {
                                             let render = move |tex: &str, display: bool| {

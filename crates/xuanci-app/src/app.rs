@@ -52,6 +52,7 @@ const MENU_LATEX_INSTALL: usize = 14;
 const MENU_LATEX_UNINSTALL: usize = 15;
 const MENU_LATEX_OPEN_DIR: usize = 16;
 const MENU_LATEX_ENABLE: usize = 17;
+const MENU_CODE_HIGHLIGHT: usize = 18;
 const MENU_PROVIDER_BASE: usize = 200;
 const MENU_TEMPLATE_BASE: usize = 300;
 const MENU_TEMPLATE_ADD: usize = 400;
@@ -309,6 +310,7 @@ unsafe extern "system" fn main_wndproc(
                         MENU_AUTOSTART => toggle_autostart(),
                         MENU_AUTO_FALLBACK => toggle_auto_fallback(),
                         MENU_MARKDOWN_RENDER => toggle_markdown_render(),
+                        MENU_CODE_HIGHLIGHT => toggle_code_highlight(),
                         MENU_PROVIDER_ADD => add_provider(hwnd),
                         MENU_PROVIDER_EDIT => edit_active_provider(hwnd),
                         MENU_PROVIDER_DELETE => delete_active_provider(hwnd),
@@ -950,6 +952,14 @@ fn toggle_markdown_render() {
     }
 }
 
+fn toggle_code_highlight() {
+    let mut settings = settings_snapshot();
+    settings.code_highlight = !settings.code_highlight;
+    if let Err(e) = save_settings_cell(&settings) {
+        dialog::error(&format!("保存设置失败：{e}"));
+    }
+}
+
 fn toggle_latex_plugin() {
     let mut settings = settings_snapshot();
     settings.latex_plugin_enabled = !settings.latex_plugin_enabled;
@@ -1363,6 +1373,20 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             MF_STRING
         };
         let _ = AppendMenuW(menu, markdown_flags, MENU_MARKDOWN_RENDER, w!("渲染 Markdown"));
+
+        let code_flags = if !settings.markdown_render {
+            MENU_ITEM_FLAGS(MF_STRING.0 | MF_GRAYED.0)
+        } else if settings.code_highlight {
+            MENU_ITEM_FLAGS(MF_STRING.0 | MF_CHECKED.0)
+        } else {
+            MF_STRING
+        };
+        let _ = AppendMenuW(
+            menu,
+            code_flags,
+            MENU_CODE_HIGHLIGHT,
+            w!("代码语法高亮（关闭可省内存）"),
+        );
 
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("退出"));

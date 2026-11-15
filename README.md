@@ -18,7 +18,7 @@ Windows 全局划词工具：在任意软件中选中文字，自动弹出小工
 | 安全策略 | 密码框拒绝、管理员程序提示、终端禁用 Ctrl+C、文件/图片剪贴板回退保护 |
 | 流式结果窗 | 可滚动、复制纯文本、复制 Markdown、停止、关闭 |
 | Markdown 渲染 | 流式阶段显示纯文本，完成后渲染为富文本；支持标题、列表、任务列表、表格、引用、代码块、脚注、删除线、行内代码、链接；可在托盘关闭并回退纯文本 |
-| 代码高亮 | 代码块按语言高亮（Rust/Python/JS/TS/C/C++/JSON/Shell/SQL 等 syntect 内置语言），未知语言回退等宽文本 |
+| 代码高亮 | 代码块按语言高亮（Rust/Python/JS/TS/C/C++/JSON/Shell/SQL 等 syntect 内置语言），未知语言回退等宽文本；可在托盘关闭，关闭后不加载高亮数据（约省 8 MB） |
 | 自定义动作 | 托盘「动作模板」子菜单：添加、编辑、删除按钮和提示词；保存后立即重建工具条，无需重启 |
 | 模板文件 | 也可直接编辑 `%LOCALAPPDATA%\XuanCi\templates.json`，重启后生效 |
 | LaTeX 公式（可选插件） | 默认不安装；从托盘安装官方 `xuanci-latex.exe` 后，`$...$` / `$$...$$` 转换为易读文本（分式、上下标、根号、希腊字母等）；未安装时显示源码 |
@@ -87,11 +87,13 @@ Markdown 相关设置（均可在托盘菜单切换）：
 ```json
 {
   "markdown_render": true,
+  "code_highlight": true,
   "latex_plugin_enabled": true
 }
 ```
 
 - `markdown_render`：是否把 AI 回复渲染为富文本，默认 `true`；关闭后显示原始 Markdown。
+- `code_highlight`：是否对代码块做语法高亮，默认 `true`；关闭后代码块仍以等宽纯文本显示，并避免加载 syntect（约 8 MB 私有内存）。
 - `latex_plugin_enabled`：安装 LaTeX 插件后是否启用，默认 `true`；没有安装插件时无影响。
 
 ### 构建可选 LaTeX 插件

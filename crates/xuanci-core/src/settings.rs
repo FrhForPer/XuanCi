@@ -35,6 +35,10 @@ fn default_markdown_render() -> bool {
     true
 }
 
+fn default_code_highlight() -> bool {
+    true
+}
+
 fn default_latex_plugin_enabled() -> bool {
     true
 }
@@ -59,6 +63,10 @@ pub struct AppSettings {
     /// Render result Markdown into rich text. Plain text remains as fallback.
     #[serde(default = "default_markdown_render")]
     pub markdown_render: bool,
+    /// Apply syntax highlighting to fenced code blocks. syntect costs about
+    /// 8 MB once loaded, so users can turn this off to save memory.
+    #[serde(default = "default_code_highlight")]
+    pub code_highlight: bool,
     /// Use the optional external LaTeX plugin when it is installed.
     #[serde(default = "default_latex_plugin_enabled")]
     pub latex_plugin_enabled: bool,
@@ -77,6 +85,7 @@ impl Default for AppSettings {
             translate_target: default_translate_target(),
             clipboard_fallback_auto: default_clipboard_fallback_auto(),
             markdown_render: default_markdown_render(),
+            code_highlight: default_code_highlight(),
             latex_plugin_enabled: default_latex_plugin_enabled(),
             providers: vec![ProviderProfile {
                 id: "deepseek".to_string(),
@@ -304,6 +313,7 @@ mod tests {
         assert!(settings.providers.is_empty());
         assert!(settings.clipboard_fallback_auto);
         assert!(settings.markdown_render);
+        assert!(settings.code_highlight);
         assert!(settings.latex_plugin_enabled);
 
         settings.normalize();

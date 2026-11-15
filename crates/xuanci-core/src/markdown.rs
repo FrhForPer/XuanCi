@@ -36,8 +36,20 @@ const FONT_SYMBOL: &str = "Segoe UI Symbol";
 
 const BODY_SIZE: u32 = 21; // half-points: 10.5pt
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RenderOptions {}
+#[derive(Debug, Clone, Copy)]
+pub struct RenderOptions {
+    /// Highlight fenced code blocks. Disabling this avoids loading syntect,
+    /// which costs about 8 MB of private memory.
+    pub code_highlight: bool,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self {
+            code_highlight: true,
+        }
+    }
+}
 
 struct ListLevel {
     ordered: bool,
@@ -79,6 +91,7 @@ type MathRenderFn<'a> = &'a dyn Fn(&str, bool) -> Option<MathFragment>;
 
 struct Rtf<'a> {
     math_renderer: Option<MathRenderFn<'a>>,
+    code_highlight: bool,
     body: String,
     colors: Vec<(u8, u8, u8)>,
     color_map: HashMap<(u8, u8, u8), usize>,
@@ -99,9 +112,10 @@ struct Rtf<'a> {
 }
 
 impl<'a> Rtf<'a> {
-    fn new(_options: RenderOptions, math_renderer: Option<MathRenderFn<'a>>) -> Self {
+    fn new(options: RenderOptions, math_renderer: Option<MathRenderFn<'a>>) -> Self {
         let mut this = Self {
             math_renderer,
+            code_highlight: options.code_highlight,
             body: String::new(),
             colors: Vec::new(),
             color_map: HashMap::new(),
@@ -694,6 +708,9 @@ impl<'a> Rtf<'a> {
     }
 
     fn code_runs(&mut self, code: &str, lang: &str) -> String {
+        if !self.code_highlight {
+            return plain_code_runs(code);
+        }
         let lang = lang
             .split(|c: char| c == ',' || c.is_whitespace())
             .next()
@@ -1055,6 +1072,23 @@ mod tests {
         assert!(rtf.contains("\\f1\\fs18\\cb"));
         assert!(rtf.contains("https://example.com"));
         assert!(rtf.contains("\\cf5"));
+    }
+
+    #[test]
+    fn code_highlight_can_be_disabled() {
+        let markdown = "```rust\nfn main() { println!(\"hi\"); }\n```\n";
+
+        let highlighted = to_rtf(markdown);
+        assert!(highlighted.contains("{\\cf"));
+
+        let plain = to_rtf_with(
+            markdown,
+            RenderOptions {
+                code_highlight: false,
+            },
+        );
+        assert!(!plain.contains("{\\cf"));
+        assert!(plain.contains("fn main()"));
     }
 
     #[test]
