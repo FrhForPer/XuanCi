@@ -35,6 +35,10 @@ fn default_markdown_render() -> bool {
     true
 }
 
+fn default_latex_plugin_enabled() -> bool {
+    true
+}
+
 /// Missing `providers` must stay empty so `normalize()` can migrate the legacy
 /// top-level `base_url` / `model` instead of silently falling back to DeepSeek.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,10 +59,9 @@ pub struct AppSettings {
     /// Render result Markdown into rich text. Plain text remains as fallback.
     #[serde(default = "default_markdown_render")]
     pub markdown_render: bool,
-    /// Allow the renderer to embed local PNG/JPEG files. Off by default:
-    /// model output must not be able to read arbitrary local files silently.
-    #[serde(default)]
-    pub render_local_images: bool,
+    /// Use the optional external LaTeX plugin when it is installed.
+    #[serde(default = "default_latex_plugin_enabled")]
+    pub latex_plugin_enabled: bool,
     #[serde(default)]
     pub providers: Vec<ProviderProfile>,
     #[serde(default)]
@@ -74,7 +77,7 @@ impl Default for AppSettings {
             translate_target: default_translate_target(),
             clipboard_fallback_auto: default_clipboard_fallback_auto(),
             markdown_render: default_markdown_render(),
-            render_local_images: false,
+            latex_plugin_enabled: default_latex_plugin_enabled(),
             providers: vec![ProviderProfile {
                 id: "deepseek".to_string(),
                 name: "DeepSeek".to_string(),
@@ -301,7 +304,7 @@ mod tests {
         assert!(settings.providers.is_empty());
         assert!(settings.clipboard_fallback_auto);
         assert!(settings.markdown_render);
-        assert!(!settings.render_local_images);
+        assert!(settings.latex_plugin_enabled);
 
         settings.normalize();
         assert_eq!(settings.providers.len(), 1);

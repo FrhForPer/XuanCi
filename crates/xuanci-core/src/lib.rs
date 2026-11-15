@@ -2,6 +2,7 @@
 
 pub mod ai;
 pub mod deepseek;
+pub mod latex_plugin;
 pub mod markdown;
 pub mod prompt;
 pub mod selection;

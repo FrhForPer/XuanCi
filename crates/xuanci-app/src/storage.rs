@@ -69,6 +69,13 @@ pub fn templates_path() -> PathBuf {
     paths::app_data_dir().join("templates.json")
 }
 
+pub fn save_templates(templates: &[PromptTemplate]) -> Result<(), String> {
+    paths::ensure_app_data_dir()?;
+    let text = serde_json::to_string_pretty(templates)
+        .map_err(|e| format!("序列化动作模板失败：{e}"))?;
+    fs::write(templates_path(), text).map_err(|e| format!("写入动作模板失败：{e}"))
+}
+
 /// Loads templates.json, creating it with sane defaults on first run.
 pub fn load_templates() -> Vec<PromptTemplate> {
     let path = templates_path();

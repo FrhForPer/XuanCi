@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use pulldown_cmark::{
@@ -16,10 +15,10 @@ use syntect::highlighting::{FontStyle, Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
+use crate::latex_plugin::{MathFragment, MathStyle as PluginMathStyle};
+
 /// Renders at most this many source characters.
 const MAX_INPUT_CHARS: usize = 300_000;
-/// Skip local images larger than this (bytes).
-const MAX_IMAGE_BYTES: u64 = 2 * 1024 * 1024;
 
 // Base color table indices (1-based in RTF).
 const C_TEXT: usize = 1;
@@ -38,11 +37,7 @@ const FONT_SYMBOL: &str = "Segoe UI Symbol";
 const BODY_SIZE: u32 = 21; // half-points: 10.5pt
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct RenderOptions {
-    /// Embed local PNG/JPEG files referenced by absolute paths. Off by default
-    /// because it lets model output read files from the local machine.
-    pub embed_local_images: bool,
-}
+pub struct RenderOptions {}
 
 struct ListLevel {
     ordered: bool,
@@ -80,8 +75,10 @@ struct ImageState {
     alt: String,
 }
 
-struct Rtf {
-    options: RenderOptions,
+type MathRenderFn<'a> = &'a dyn Fn(&str, bool) -> Option<MathFragment>;
+
+struct Rtf<'a> {
+    math_renderer: Option<MathRenderFn<'a>>,
     body: String,
     colors: Vec<(u8, u8, u8)>,
     color_map: HashMap<(u8, u8, u8), usize>,
@@ -101,10 +98,10 @@ struct Rtf {
     next_footnote: usize,
 }
 
-impl Rtf {
-    fn new(options: RenderOptions) -> Self {
+impl<'a> Rtf<'a> {
+    fn new(_options: RenderOptions, math_renderer: Option<MathRenderFn<'a>>) -> Self {
         let mut this = Self {
-            options,
+            math_renderer,
             body: String::new(),
             colors: Vec::new(),
             color_map: HashMap::new(),
@@ -419,6 +416,33 @@ impl Rtf {
         if let Some(link) = self.link.as_mut() {
             link.text.push_str(math);
         }
+
+        if let Some(renderer) = self.math_renderer {
+            if let Some(fragment) = renderer(math, display) {
+                if display {
+                    self.ensure_par();
+                    self.raw("\\pard\\qc\\sb120\\sa120\\cf3 ");
+                }
+                for segment in &fragment.segments {
+                    let prefix = match segment.style {
+                        PluginMathStyle::Normal => "",
+                        PluginMathStyle::Super => "\\super ",
+                        PluginMathStyle::Sub => "\\sub ",
+                    };
+                    let mut run = format!("{{{prefix}\\cf3 ");
+                    escape_into(&segment.text, &mut run);
+                    run.push('}');
+                    self.raw(&run);
+                }
+                if display {
+                    self.raw("\\par ");
+                } else {
+                    self.raw(" ");
+                }
+                return;
+            }
+        }
+
         let mut run = String::from("{\\f1\\fs18\\cf3 ");
         if display {
             run.push_str("$$");
@@ -630,14 +654,6 @@ impl Rtf {
         let Some(image) = self.image.take() else {
             return;
         };
-        if self.options.embed_local_images {
-            if let Some(picture) = load_local_image(&image.url) {
-                self.ensure_par();
-                self.raw(&picture);
-                self.raw("\\par ");
-                return;
-            }
-        }
 
         let label = if image.alt.trim().is_empty() {
             "图片"
@@ -934,12 +950,20 @@ pub fn to_rtf(markdown: &str) -> String {
 }
 
 pub fn to_rtf_with(markdown: &str, options: RenderOptions) -> String {
+    to_rtf_with_math(markdown, options, None)
+}
+
+pub fn to_rtf_with_math(
+    markdown: &str,
+    options: RenderOptions,
+    math_renderer: Option<&dyn Fn(&str, bool) -> Option<MathFragment>>,
+) -> String {
     let input = if markdown.chars().count() > MAX_INPUT_CHARS {
         markdown.chars().take(MAX_INPUT_CHARS).collect::<String>()
     } else {
         markdown.to_string()
     };
-    let mut rtf = Rtf::new(options);
+    let mut rtf = Rtf::new(options, math_renderer);
     for event in Parser::new_ext(&input, options_flags()) {
         match event {
             Event::Start(tag) => rtf.start(tag),
@@ -983,122 +1007,6 @@ fn plain_code_runs(code: &str) -> String {
         escape_into(line, &mut out);
     }
     out
-}
-
-/// Embeds a local PNG/JPEG as an RTF picture. Remote URLs are never fetched.
-fn load_local_image(url: &str) -> Option<String> {
-    let path = local_image_path(url)?;
-    let metadata = std::fs::metadata(&path).ok()?;
-    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_IMAGE_BYTES {
-        return None;
-    }
-    let bytes = std::fs::read(&path).ok()?;
-
-    let (blip, width, height) = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
-        if bytes.len() < 24 {
-            return None;
-        }
-        let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
-        let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
-        ("\\pngblip", width, height)
-    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        let (width, height) = jpeg_dimensions(&bytes)?;
-        ("\\jpegblip", width, height)
-    } else {
-        return None;
-    };
-    if width == 0 || height == 0 {
-        return None;
-    }
-
-    let mut goal_w = width as i64 * 15;
-    let mut goal_h = height as i64 * 15;
-    let max_w = 6000i64;
-    let max_h = 4000i64;
-    if goal_w > max_w || goal_h > max_h {
-        let scale_w = max_w as f64 / goal_w as f64;
-        let scale_h = max_h as f64 / goal_h as f64;
-        let scale = scale_w.min(scale_h);
-        goal_w = (goal_w as f64 * scale).max(1.0) as i64;
-        goal_h = (goal_h as f64 * scale).max(1.0) as i64;
-    }
-
-    let mut hex = String::with_capacity(bytes.len() * 2);
-    for byte in &bytes {
-        let _ = write!(hex, "{byte:02x}");
-    }
-
-    Some(format!(
-        "{{\\pict{blip}\\picw{width}\\pich{height}\\picwgoal{goal_w}\\pichgoal{goal_h} {hex}}}"
-    ))
-}
-
-fn local_image_path(url: &str) -> Option<PathBuf> {
-    let url = url.trim();
-    let extension_ok = {
-        let lower = url.to_ascii_lowercase();
-        lower.ends_with(".png")
-            || lower.ends_with(".jpg")
-            || lower.ends_with(".jpeg")
-            || lower.contains(".png?")
-            || lower.contains(".jpg?")
-            || lower.contains(".jpeg?")
-    };
-    if !extension_ok {
-        return None;
-    }
-
-    if let Some(rest) = url.strip_prefix("file:///") {
-        let path = rest.replace('/', "\\");
-        return Some(PathBuf::from(path));
-    }
-    if let Some(rest) = url.strip_prefix("file://") {
-        let path = rest.replace('/', "\\");
-        return Some(PathBuf::from(path));
-    }
-
-    let bytes = url.as_bytes();
-    if bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/')
-    {
-        return Some(PathBuf::from(url));
-    }
-    None
-}
-
-fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
-    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
-        return None;
-    }
-    let mut index = 2;
-    while index + 9 < bytes.len() {
-        if bytes[index] != 0xFF {
-            index += 1;
-            continue;
-        }
-        let marker = bytes[index + 1];
-        if marker == 0xD8 || marker == 0xD9 {
-            index += 2;
-            continue;
-        }
-        let length = u16::from_be_bytes([bytes[index + 2], bytes[index + 3]]) as usize;
-        if length < 2 || index + 2 + length > bytes.len() {
-            break;
-        }
-        let is_sof = matches!(
-            marker,
-            0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF
-        );
-        if is_sof {
-            let height = u16::from_be_bytes([bytes[index + 5], bytes[index + 6]]) as u32;
-            let width = u16::from_be_bytes([bytes[index + 7], bytes[index + 8]]) as u32;
-            return Some((width, height));
-        }
-        index += 2 + length;
-    }
-    None
 }
 
 #[cfg(test)]
@@ -1160,31 +1068,34 @@ mod tests {
     }
 
     #[test]
-    fn embeds_local_png_when_enabled() {
-        // 1x1 transparent PNG.
-        let hex = "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489\
-                   0000000a49444154789c6360000100000500010d0a2db40000000049454e44ae426082";
-        let bytes: Vec<u8> = (0..hex.len())
-            .step_by(2)
-            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
-            .collect();
-        let path = std::env::temp_dir().join(format!(
-            "xuanci-md-test-{}.png",
-            std::process::id()
-        ));
-        std::fs::write(&path, &bytes).unwrap();
-        let markdown = format!("![测试]({})", path.display());
-        let rtf = to_rtf_with(
-            &markdown,
-            RenderOptions {
-                embed_local_images: true,
-            },
-        );
-        let _ = std::fs::remove_file(&path);
+    fn renders_math_segments_when_renderer_is_available() {
+        use crate::latex_plugin::MathSegment;
 
+        let renderer = |_tex: &str, _display: bool| {
+            Some(MathFragment {
+                segments: vec![
+                    MathSegment {
+                        text: "x".into(),
+                        style: PluginMathStyle::Normal,
+                    },
+                    MathSegment {
+                        text: "2".into(),
+                        style: PluginMathStyle::Super,
+                    },
+                ],
+            })
+        };
+        let rtf = to_rtf_with_math(
+            "前 $x^2$ 后\n\n$$y$$\n",
+            RenderOptions::default(),
+            Some(&renderer),
+        );
         assert!(rtf.is_ascii());
-        assert!(rtf.contains("\\pict\\pngblip"));
-        assert!(rtf.contains("\\picwgoal"));
+        assert!(rtf.contains("\\super"));
+        assert!(rtf.contains("x"));
+        assert!(rtf.contains("2"));
+        assert!(rtf.contains("\\pard\\qc"));
+        assert!(!rtf.contains("\\pict"));
     }
 
     #[test]

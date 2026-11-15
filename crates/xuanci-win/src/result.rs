@@ -1,12 +1,15 @@
 //! Streaming result window backed by a RichEdit control.
 
 use std::mem::zeroed;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::core::{w, PCWSTR, HSTRING};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
 use windows::Win32::UI::Controls::RichEdit::{EDITSTREAM, EM_STREAMIN, SF_RTF};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -62,6 +65,7 @@ fn dbg(msg: &str) {
 const MARGIN: i32 = 8;
 const BAR_H: i32 = 46;
 const BUTTON_W: i32 = 82;
+
 
 #[derive(Default)]
 struct StreamShared {
@@ -241,11 +245,11 @@ pub fn start_stream(
     settings: AppSettings,
     api_key: String,
     request: ChatRequest,
+    latex_plugin: Option<PathBuf>,
 ) -> Result<(), String> {
     let state = state(hwnd).ok_or_else(|| "结果窗口状态丢失".to_string())?;
 
     let render_markdown = settings.markdown_render;
-    let render_local_images = settings.render_local_images;
 
     let mut shared = state.shared.lock().map_err(|_| "状态锁失败".to_string())?;
     shared.pending.clear();
@@ -300,12 +304,22 @@ pub fn start_stream(
                         if !full.is_empty() {
                             let rendered = std::panic::catch_unwind(
                                 std::panic::AssertUnwindSafe(|| {
-                                    markdown::to_rtf_with(
-                                        &full,
-                                        RenderOptions {
-                                            embed_local_images: render_local_images,
-                                        },
-                                    )
+                                    let options = RenderOptions::default();
+                                    match latex_plugin.clone() {
+                                        Some(path) => {
+                                            let render = move |tex: &str, display: bool| {
+                                                xuanci_core::latex_plugin::render_formula(
+                                                    &path, tex, display,
+                                                )
+                                            };
+                                            markdown::to_rtf_with_math(
+                                                &full,
+                                                options,
+                                                Some(&render),
+                                            )
+                                        }
+                                        None => markdown::to_rtf_with(&full, options),
+                                    }
                                 }),
                             );
                             match rendered {

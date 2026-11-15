@@ -2,6 +2,7 @@
 
 mod app;
 mod autostart;
+mod latex_plugin;
 mod pipeline;
 mod storage;
 

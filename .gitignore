@@ -1,4 +1,5 @@
 /target
+/plugins/latex/target
 **/*.rs.bk
 
 # Local user data must never be committed

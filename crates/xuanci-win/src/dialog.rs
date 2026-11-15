@@ -2,8 +2,13 @@
 
 use std::cell::RefCell;
 use std::mem::zeroed;
+use std::path::PathBuf;
 
-use windows::core::{w, HSTRING, PCWSTR};
+use windows::core::{w, HSTRING, PCWSTR, PWSTR};
+use windows::Win32::UI::Controls::Dialogs::{
+    GetOpenFileNameW, OPENFILENAMEW, OPEN_FILENAME_FLAGS, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
+    OFN_PATHMUSTEXIST,
+};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, GetStockObject, MonitorFromPoint, DEFAULT_GUI_FONT, MONITORINFO,
@@ -62,6 +67,32 @@ pub fn confirm(text: &str) -> bool {
             w!("XuanCi"),
             MB_YESNO | MB_ICONQUESTION,
         ) == IDYES
+    }
+}
+
+/// Native "Open file" dialog. Returns None when cancelled.
+pub fn open_file(parent: HWND, title: &str) -> Option<PathBuf> {
+    unsafe {
+        let mut buffer = vec![0u16; 32768];
+        let filter: Vec<u16> = "可执行文件 (*.exe)\0*.exe\0所有文件 (*.*)\0*.*\0\0"
+            .encode_utf16()
+            .collect();
+        let title_h = HSTRING::from(title);
+        let mut ofn = OPENFILENAMEW::default();
+        ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+        ofn.hwndOwner = parent;
+        ofn.lpstrFilter = PCWSTR(filter.as_ptr());
+        ofn.lpstrFile = PWSTR(buffer.as_mut_ptr());
+        ofn.nMaxFile = buffer.len() as u32;
+        ofn.lpstrTitle = PCWSTR(title_h.as_ptr());
+        ofn.Flags = OPEN_FILENAME_FLAGS(
+            OFN_FILEMUSTEXIST.0 | OFN_PATHMUSTEXIST.0 | OFN_HIDEREADONLY.0,
+        );
+        if !GetOpenFileNameW(&mut ofn).as_bool() {
+            return None;
+        }
+        let length = buffer.iter().position(|&value| value == 0).unwrap_or(0);
+        Some(PathBuf::from(String::from_utf16_lossy(&buffer[..length])))
     }
 }
 

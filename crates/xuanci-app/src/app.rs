@@ -10,8 +10,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, DispatchMessageW, GetCursorPos, GetMessageW,
     PostMessageW, PostQuitMessage, SetForegroundWindow, TrackPopupMenu, TranslateMessage,
-    MENU_ITEM_FLAGS, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, TPM_BOTTOMALIGN,
-    TPM_RIGHTBUTTON, WM_COMMAND, WM_DESTROY, WM_HOTKEY,
+    MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
+    TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, WM_COMMAND, WM_DESTROY, WM_HOTKEY,
 };
 
 use xuanci_core::ai::ChatRequest;
@@ -44,12 +44,19 @@ const MENU_SET_KEY: usize = 3;
 const MENU_AUTOSTART: usize = 6;
 const MENU_AUTO_FALLBACK: usize = 7;
 const MENU_MARKDOWN_RENDER: usize = 8;
-const MENU_LOCAL_IMAGES: usize = 9;
 const MENU_PROVIDER_ADD: usize = 10;
 const MENU_PROVIDER_EDIT: usize = 11;
 const MENU_PROVIDER_DELETE: usize = 12;
 const MENU_FETCH_MODELS: usize = 13;
+const MENU_LATEX_INSTALL: usize = 14;
+const MENU_LATEX_UNINSTALL: usize = 15;
+const MENU_LATEX_OPEN_DIR: usize = 16;
+const MENU_LATEX_ENABLE: usize = 17;
 const MENU_PROVIDER_BASE: usize = 200;
+const MENU_TEMPLATE_BASE: usize = 300;
+const MENU_TEMPLATE_ADD: usize = 400;
+const MENU_TEMPLATE_EDIT: usize = 401;
+const MENU_TEMPLATE_DELETE: usize = 402;
 
 const ACTION_TRANSLATE: usize = 0;
 const ACTION_ASK_AI: usize = 1;
@@ -288,8 +295,10 @@ unsafe extern "system" fn main_wndproc(
             }
             WM_COMMAND => {
                 let id = wparam.0 & 0xFFFF;
-                if id >= MENU_PROVIDER_BASE {
+                if (MENU_PROVIDER_BASE..MENU_TEMPLATE_BASE).contains(&id) {
                     switch_provider(id - MENU_PROVIDER_BASE);
+                } else if (MENU_TEMPLATE_BASE..MENU_TEMPLATE_ADD).contains(&id) {
+                    edit_template_at(id - MENU_TEMPLATE_BASE);
                 } else {
                     match id {
                         MENU_TEST_CAPTURE => spawn_hotkey_capture(ACTION_TRANSLATE),
@@ -300,11 +309,29 @@ unsafe extern "system" fn main_wndproc(
                         MENU_AUTOSTART => toggle_autostart(),
                         MENU_AUTO_FALLBACK => toggle_auto_fallback(),
                         MENU_MARKDOWN_RENDER => toggle_markdown_render(),
-                        MENU_LOCAL_IMAGES => toggle_local_images(),
                         MENU_PROVIDER_ADD => add_provider(hwnd),
                         MENU_PROVIDER_EDIT => edit_active_provider(hwnd),
                         MENU_PROVIDER_DELETE => delete_active_provider(hwnd),
                         MENU_FETCH_MODELS => fetch_models(),
+                        MENU_LATEX_INSTALL => crate::latex_plugin::install(hwnd),
+                        MENU_LATEX_UNINSTALL => crate::latex_plugin::uninstall(hwnd),
+                        MENU_LATEX_OPEN_DIR => crate::latex_plugin::open_dir(),
+                        MENU_LATEX_ENABLE => toggle_latex_plugin(),
+                        MENU_TEMPLATE_ADD => add_custom_action(hwnd),
+                        MENU_TEMPLATE_EDIT => {
+                            if let Some(index) =
+                                select_template_index(hwnd, "编辑动作", "选择要编辑的动作")
+                            {
+                                edit_template_at(index);
+                            }
+                        }
+                        MENU_TEMPLATE_DELETE => {
+                            if let Some(index) =
+                                select_template_index(hwnd, "删除动作", "选择要删除的动作")
+                            {
+                                delete_template_at(index);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -505,10 +532,11 @@ fn launch_result(title: &str, settings: AppSettings, api_key: String, request: C
         settings.active_name(),
         settings.endpoint()
     ));
+    let latex = crate::latex_plugin::plugin_path(settings.latex_plugin_enabled);
     match result::open(app_hwnd(), title) {
         Ok(hwnd) => {
             debug_log("result window opened");
-            match result::start_stream(hwnd, title, settings, api_key, request) {
+            match result::start_stream(hwnd, title, settings, api_key, request, latex) {
                 Ok(()) => debug_log("stream started"),
                 Err(e) => {
                     debug_log(&format!("start_stream failed: {e}"));
@@ -922,12 +950,233 @@ fn toggle_markdown_render() {
     }
 }
 
-fn toggle_local_images() {
+fn toggle_latex_plugin() {
     let mut settings = settings_snapshot();
-    settings.render_local_images = !settings.render_local_images;
+    settings.latex_plugin_enabled = !settings.latex_plugin_enabled;
     if let Err(e) = save_settings_cell(&settings) {
         dialog::error(&format!("保存设置失败：{e}"));
     }
+}
+
+fn refresh_templates(templates: Vec<PromptTemplate>) -> Result<(), String> {
+    storage::save_templates(&templates)?;
+    if let Ok(mut cell) = templates_cell().lock() {
+        *cell = templates;
+    }
+    rebuild_toolbar();
+    Ok(())
+}
+
+fn rebuild_toolbar() {
+    let app = app_hwnd();
+    if app.0.is_null() {
+        return;
+    }
+    let old = hwnd_from(TOOLBAR_HWND.load(Ordering::Relaxed));
+    if !old.0.is_null() {
+        toolbar::hide(old);
+        toolbar::destroy(old);
+        TOOLBAR_HWND.store(0, Ordering::SeqCst);
+    }
+
+    let templates = template_snapshot();
+    let mut labels: Vec<String> = vec!["翻译".to_string(), "AI 问答".to_string()];
+    labels.extend(templates.iter().map(|template| template.name.clone()));
+    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    match toolbar::create(app, &refs) {
+        Ok(toolbar_hwnd) => {
+            TOOLBAR_HWND.store(toolbar_hwnd.0 as isize, Ordering::SeqCst);
+            debug_log(&format!("toolbar rebuilt with {} actions", refs.len()));
+        }
+        Err(e) => dialog::error(&format!("重建工具条失败：{e}")),
+    }
+}
+
+fn new_template_id(existing: &[PromptTemplate], name: &str) -> String {
+    let base: String = name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let base = if base.is_empty() {
+        "custom".to_string()
+    } else {
+        base
+    };
+    let mut id = base.clone();
+    let mut suffix = 2;
+    while existing.iter().any(|template| template.id == id) {
+        id = format!("{base}-{suffix}");
+        suffix += 1;
+    }
+    id
+}
+
+fn add_custom_action(parent: HWND) {
+    let spec = InputSpec {
+        title: "添加动作",
+        label: "显示名称（会出现在工具条上）",
+        initial: "",
+        password: false,
+        multiline: false,
+    };
+    let Some(name) = dialog::input_text(parent, spec) else {
+        return;
+    };
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        dialog::error("动作名称不能为空。");
+        return;
+    }
+
+    let spec = InputSpec {
+        title: "添加动作",
+        label: "指令（告诉 AI 要做什么；选中的文字会自动附加到末尾）",
+        initial: "",
+        password: false,
+        multiline: true,
+    };
+    let Some(instruction) = dialog::input_text(parent, spec) else {
+        return;
+    };
+    let instruction = instruction.trim().to_string();
+    if instruction.is_empty() {
+        dialog::error("指令不能为空。");
+        return;
+    }
+
+    let spec = InputSpec {
+        title: "添加动作",
+        label: "系统提示（可选，直接确定表示留空）",
+        initial: "",
+        password: false,
+        multiline: true,
+    };
+    let Some(system) = dialog::input_text(parent, spec) else {
+        return;
+    };
+
+    let templates = template_snapshot();
+    let id = new_template_id(&templates, &name);
+    let user_template = if instruction.contains("{{text}}") {
+        instruction
+    } else {
+        format!("{instruction}\n\n{{{{text}}}}")
+    };
+
+    let mut updated = templates;
+    updated.push(PromptTemplate {
+        id,
+        name: name.clone(),
+        system_prompt: system.trim().to_string(),
+        user_template,
+        temperature: Some(0.5),
+    });
+
+    match refresh_templates(updated) {
+        Ok(()) => dialog::info(&format!("已添加动作「{name}」，工具条已更新。")),
+        Err(e) => dialog::error(&format!("保存动作失败：{e}")),
+    }
+}
+
+fn edit_template_at(index: usize) {
+    let templates = template_snapshot();
+    let Some(template) = templates.get(index).cloned() else {
+        return;
+    };
+
+    let spec = InputSpec {
+        title: "编辑动作",
+        label: "显示名称",
+        initial: &template.name,
+        password: false,
+        multiline: false,
+    };
+    let Some(name) = dialog::input_text(app_hwnd(), spec) else {
+        return;
+    };
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        dialog::error("动作名称不能为空。");
+        return;
+    }
+
+    let spec = InputSpec {
+        title: "编辑动作",
+        label: "指令（必须保留 {{text}} 占位符；删掉会自动追加）",
+        initial: &template.user_template,
+        password: false,
+        multiline: true,
+    };
+    let Some(instruction) = dialog::input_text(app_hwnd(), spec) else {
+        return;
+    };
+    let mut user_template = instruction.trim().to_string();
+    if user_template.is_empty() {
+        dialog::error("指令不能为空。");
+        return;
+    }
+    if !user_template.contains("{{text}}") {
+        user_template.push_str("\n\n{{text}}");
+    }
+
+    let spec = InputSpec {
+        title: "编辑动作",
+        label: "系统提示（可选）",
+        initial: &template.system_prompt,
+        password: false,
+        multiline: true,
+    };
+    let Some(system) = dialog::input_text(app_hwnd(), spec) else {
+        return;
+    };
+
+    let mut updated = templates;
+    updated[index] = PromptTemplate {
+        id: template.id,
+        name,
+        system_prompt: system.trim().to_string(),
+        user_template,
+        temperature: template.temperature.or(Some(0.5)),
+    };
+
+    match refresh_templates(updated) {
+        Ok(()) => dialog::info("动作已保存，工具条已更新。"),
+        Err(e) => dialog::error(&format!("保存动作失败：{e}")),
+    }
+}
+
+fn delete_template_at(index: usize) {
+    let templates = template_snapshot();
+    let Some(template) = templates.get(index) else {
+        return;
+    };
+    let name = template.name.clone();
+    if !dialog::confirm(&format!("确定删除动作「{name}」吗？")) {
+        return;
+    }
+
+    let mut updated = templates;
+    updated.remove(index);
+    match refresh_templates(updated) {
+        Ok(()) => dialog::info(&format!("已删除动作「{name}」。")),
+        Err(e) => dialog::error(&format!("保存动作失败：{e}")),
+    }
+}
+
+fn select_template_index(parent: HWND, title: &str, label: &str) -> Option<usize> {
+    let templates = template_snapshot();
+    if templates.is_empty() {
+        dialog::info("还没有自定义动作，请先添加。");
+        return None;
+    }
+    let items: Vec<String> = templates
+        .iter()
+        .enumerate()
+        .map(|(index, template)| format!("{}. {}", index + 1, template.name))
+        .collect();
+    let choice = dialog::select_item(parent, title, label, &items)?;
+    items.iter().position(|item| item == &choice)
 }
 
 fn toggle_autostart() {
@@ -991,6 +1240,102 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         );
         let _ = AppendMenuW(menu, MF_STRING, MENU_FETCH_MODELS, w!("获取模型列表…"));
         let _ = AppendMenuW(menu, MF_STRING, MENU_SET_KEY, w!("设置当前 API Key…"));
+
+        let Ok(template_menu) = CreatePopupMenu() else {
+            let _ = DestroyMenu(submenu);
+            let _ = DestroyMenu(menu);
+            return;
+        };
+        let templates = template_snapshot();
+        if templates.is_empty() {
+            let _ = AppendMenuW(
+                template_menu,
+                MENU_ITEM_FLAGS(MF_STRING.0 | MF_GRAYED.0),
+                0,
+                w!("（暂无自定义动作）"),
+            );
+        } else {
+            for (index, template) in templates.iter().enumerate() {
+                let label = HSTRING::from(template.name.clone());
+                let _ = AppendMenuW(
+                    template_menu,
+                    MF_STRING,
+                    MENU_TEMPLATE_BASE + index,
+                    PCWSTR(label.as_ptr()),
+                );
+            }
+        }
+        let _ = AppendMenuW(template_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(template_menu, MF_STRING, MENU_TEMPLATE_ADD, w!("添加动作…"));
+        let _ = AppendMenuW(template_menu, MF_STRING, MENU_TEMPLATE_EDIT, w!("编辑动作…"));
+        let _ = AppendMenuW(
+            template_menu,
+            MF_STRING,
+            MENU_TEMPLATE_DELETE,
+            w!("删除动作…"),
+        );
+
+        let template_label = HSTRING::from(format!("动作模板（{} 个）", templates.len()));
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            template_menu.0 as usize,
+            PCWSTR(template_label.as_ptr()),
+        );
+
+        let Ok(latex_menu) = CreatePopupMenu() else {
+            let _ = DestroyMenu(template_menu);
+            let _ = DestroyMenu(submenu);
+            let _ = DestroyMenu(menu);
+            return;
+        };
+        let latex_status = HSTRING::from(crate::latex_plugin::status());
+        let _ = AppendMenuW(
+            latex_menu,
+            MENU_ITEM_FLAGS(MF_STRING.0 | MF_GRAYED.0),
+            0,
+            PCWSTR(latex_status.as_ptr()),
+        );
+        if crate::latex_plugin::installed() {
+            let latex_flags = if settings.latex_plugin_enabled {
+                MENU_ITEM_FLAGS(MF_STRING.0 | MF_CHECKED.0)
+            } else {
+                MF_STRING
+            };
+            let _ = AppendMenuW(
+                latex_menu,
+                latex_flags,
+                MENU_LATEX_ENABLE,
+                w!("启用公式渲染"),
+            );
+            let _ = AppendMenuW(
+                latex_menu,
+                MF_STRING,
+                MENU_LATEX_UNINSTALL,
+                w!("卸载插件…"),
+            );
+        } else {
+            let _ = AppendMenuW(
+                latex_menu,
+                MF_STRING,
+                MENU_LATEX_INSTALL,
+                w!("安装插件…"),
+            );
+        }
+        let _ = AppendMenuW(latex_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(
+            latex_menu,
+            MF_STRING,
+            MENU_LATEX_OPEN_DIR,
+            w!("打开插件目录"),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            latex_menu.0 as usize,
+            w!("LaTeX 公式"),
+        );
+
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
         let autostart_flags = if autostart::is_enabled() {
@@ -1019,17 +1364,6 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         };
         let _ = AppendMenuW(menu, markdown_flags, MENU_MARKDOWN_RENDER, w!("渲染 Markdown"));
 
-        let image_flags = if settings.render_local_images {
-            MENU_ITEM_FLAGS(MF_STRING.0 | MF_CHECKED.0)
-        } else {
-            MF_STRING
-        };
-        let _ = AppendMenuW(
-            menu,
-            image_flags,
-            MENU_LOCAL_IMAGES,
-            w!("Markdown 中嵌入本地图片"),
-        );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("退出"));
 
@@ -1045,6 +1379,8 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             hwnd,
             None,
         );
+        let _ = DestroyMenu(latex_menu);
+        let _ = DestroyMenu(template_menu);
         let _ = DestroyMenu(submenu);
         let _ = DestroyMenu(menu);
     }
