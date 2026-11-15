@@ -3,7 +3,7 @@
 Windows 全局划词工具：在任意软件中选中文字，自动弹出小工具条，一键翻译或交给 AI；也支持全局快捷键。
 
 - 原生 Rust + Win32，无 WebView / 无浏览器内核 / 无遥测
-- DeepSeek（OpenAI 兼容）流式输出
+- 兼容任意 OpenAI 格式接口（DeepSeek、OpenAI、硅基流动、通义、智谱、Ollama、LM Studio 等），SSE 流式输出
 - API Key 使用 Windows DPAPI 加密保存在本机
 - 声明式提示词模板，改 JSON 即可扩展动作
 

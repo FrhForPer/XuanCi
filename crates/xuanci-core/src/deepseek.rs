@@ -41,22 +41,8 @@ pub fn stream_chat(
         return Err("Base URL 必须使用 HTTPS（本地测试地址除外）".into());
     }
 
-    let messages: Vec<Value> = request
-        .messages
-        .iter()
-        .map(|m| json!({ "role": m.role, "content": m.content }))
-        .collect();
-
-    let mut body = json!({
-        "model": request.model,
-        "messages": messages,
-        "stream": true,
-        "temperature": request.temperature,
-    });
-    if request.disable_thinking {
-        body["thinking"] = json!({ "type": "disabled" });
-    }
-
+    let is_deepseek = settings.base_url.to_ascii_lowercase().contains("deepseek");
+    let body = build_body(request, is_deepseek);
     let payload = serde_json::to_string(&body).map_err(|e| format!("请求序列化失败：{e}"))?;
 
     dbg(&format!(
@@ -149,6 +135,29 @@ pub fn stream_chat(
     Ok(())
 }
 
+/// Builds an OpenAI-compatible request body.
+///
+/// `thinking` is a DeepSeek extension. Sending it to other providers can be
+/// rejected as an unknown parameter, so it is only attached for DeepSeek.
+fn build_body(request: &ChatRequest, is_deepseek: bool) -> Value {
+    let messages: Vec<Value> = request
+        .messages
+        .iter()
+        .map(|m| json!({ "role": m.role, "content": m.content }))
+        .collect();
+
+    let mut body = json!({
+        "model": request.model,
+        "messages": messages,
+        "stream": true,
+        "temperature": request.temperature,
+    });
+    if request.disable_thinking && is_deepseek {
+        body["thinking"] = json!({ "type": "disabled" });
+    }
+    body
+}
+
 fn map_ureq_error(error: ureq::Error) -> String {
     match error {
         ureq::Error::StatusCode(code) => match code {
@@ -163,5 +172,32 @@ fn map_ureq_error(error: ureq::Error) -> String {
             _ => format!("请求失败（HTTP {code}）"),
         },
         other => format!("网络请求失败：{other}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::ChatMessage;
+
+    fn request() -> ChatRequest {
+        ChatRequest {
+            model: "test-model".into(),
+            messages: vec![ChatMessage::user("hi")],
+            temperature: 0.2,
+            disable_thinking: true,
+        }
+    }
+
+    #[test]
+    fn thinking_is_only_sent_to_deepseek() {
+        let non_deepseek = build_body(&request(), false);
+        assert!(non_deepseek.get("thinking").is_none());
+
+        let deepseek = build_body(&request(), true);
+        assert_eq!(
+            deepseek.get("thinking").and_then(|v| v.get("type")).and_then(|v| v.as_str()),
+            Some("disabled")
+        );
     }
 }
