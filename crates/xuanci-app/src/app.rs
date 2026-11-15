@@ -43,6 +43,8 @@ const MENU_EXIT: usize = 2;
 const MENU_SET_KEY: usize = 3;
 const MENU_AUTOSTART: usize = 6;
 const MENU_AUTO_FALLBACK: usize = 7;
+const MENU_MARKDOWN_RENDER: usize = 8;
+const MENU_LOCAL_IMAGES: usize = 9;
 const MENU_PROVIDER_ADD: usize = 10;
 const MENU_PROVIDER_EDIT: usize = 11;
 const MENU_PROVIDER_DELETE: usize = 12;
@@ -297,6 +299,8 @@ unsafe extern "system" fn main_wndproc(
                         MENU_SET_KEY => prompt_api_key(hwnd),
                         MENU_AUTOSTART => toggle_autostart(),
                         MENU_AUTO_FALLBACK => toggle_auto_fallback(),
+                        MENU_MARKDOWN_RENDER => toggle_markdown_render(),
+                        MENU_LOCAL_IMAGES => toggle_local_images(),
                         MENU_PROVIDER_ADD => add_provider(hwnd),
                         MENU_PROVIDER_EDIT => edit_active_provider(hwnd),
                         MENU_PROVIDER_DELETE => delete_active_provider(hwnd),
@@ -910,6 +914,22 @@ fn toggle_auto_fallback() {
     }
 }
 
+fn toggle_markdown_render() {
+    let mut settings = settings_snapshot();
+    settings.markdown_render = !settings.markdown_render;
+    if let Err(e) = save_settings_cell(&settings) {
+        dialog::error(&format!("保存设置失败：{e}"));
+    }
+}
+
+fn toggle_local_images() {
+    let mut settings = settings_snapshot();
+    settings.render_local_images = !settings.render_local_images;
+    if let Err(e) = save_settings_cell(&settings) {
+        dialog::error(&format!("保存设置失败：{e}"));
+    }
+}
+
 fn toggle_autostart() {
     let enable = !autostart::is_enabled();
     match autostart::set_enabled(enable) {
@@ -990,6 +1010,25 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             fallback_flags,
             MENU_AUTO_FALLBACK,
             w!("自动弹条使用剪贴板回退"),
+        );
+
+        let markdown_flags = if settings.markdown_render {
+            MENU_ITEM_FLAGS(MF_STRING.0 | MF_CHECKED.0)
+        } else {
+            MF_STRING
+        };
+        let _ = AppendMenuW(menu, markdown_flags, MENU_MARKDOWN_RENDER, w!("渲染 Markdown"));
+
+        let image_flags = if settings.render_local_images {
+            MENU_ITEM_FLAGS(MF_STRING.0 | MF_CHECKED.0)
+        } else {
+            MF_STRING
+        };
+        let _ = AppendMenuW(
+            menu,
+            image_flags,
+            MENU_LOCAL_IMAGES,
+            w!("Markdown 中嵌入本地图片"),
         );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("退出"));

@@ -2,6 +2,7 @@
 
 pub mod ai;
 pub mod deepseek;
+pub mod markdown;
 pub mod prompt;
 pub mod selection;
 pub mod settings;

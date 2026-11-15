@@ -8,6 +8,7 @@ use windows::core::{w, PCWSTR, HSTRING};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
+use windows::Win32::UI::Controls::RichEdit::{EDITSTREAM, EM_STREAMIN, SF_RTF};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos,
     GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, PostMessageW, RegisterClassW,
@@ -21,6 +22,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use xuanci_core::ai::{ChatDelta, ChatRequest};
 use xuanci_core::deepseek;
+use xuanci_core::markdown::{self, RenderOptions};
 use xuanci_core::settings::AppSettings;
 
 use crate::clipboard;
@@ -31,6 +33,7 @@ const CLASS_NAME: &str = "XuanCiResultWindow";
 const BTN_COPY: usize = 9001;
 const BTN_STOP: usize = 9002;
 const BTN_CLOSE: usize = 9003;
+const BTN_COPY_MD: usize = 9004;
 
 const EM_SETSEL: u32 = 0x00B1;
 const EM_REPLACESEL: u32 = 0x00C2;
@@ -41,6 +44,7 @@ const ES_READONLY: u32 = 0x0800;
 const BS_PUSHBUTTON: u32 = 0x0000;
 
 const BUTTON_H: i32 = 30;
+const COPY_MD_W: i32 = 120;
 
 fn dbg(msg: &str) {
     if !cfg!(debug_assertions) {
@@ -65,11 +69,51 @@ struct StreamShared {
     full: String,
     finished: bool,
     error: Option<String>,
+    /// Pre-rendered RTF, produced on the worker thread so the UI never stalls
+    /// while syntect loads its syntax definitions.
+    rendered: Option<String>,
+}
+
+struct RtfStream {
+    bytes: Vec<u8>,
+    position: usize,
+}
+
+unsafe extern "system" fn rtf_stream_callback(
+    cookie: usize,
+    buffer: *mut u8,
+    count: i32,
+    read: *mut i32,
+) -> u32 {
+    unsafe {
+        let stream = &mut *(cookie as *mut RtfStream);
+        if count <= 0 || buffer.is_null() {
+            if !read.is_null() {
+                *read = 0;
+            }
+            return 0;
+        }
+        let remaining = stream.bytes.len().saturating_sub(stream.position);
+        let size = remaining.min(count as usize);
+        if size > 0 {
+            std::ptr::copy_nonoverlapping(
+                stream.bytes.as_ptr().add(stream.position),
+                buffer,
+                size,
+            );
+            stream.position += size;
+        }
+        if !read.is_null() {
+            *read = size as i32;
+        }
+        0
+    }
 }
 
 struct ResultState {
     edit: HWND,
     copy_btn: HWND,
+    copy_md_btn: HWND,
     stop_btn: HWND,
     close_btn: HWND,
     cancel: Arc<AtomicBool>,
@@ -99,6 +143,7 @@ pub fn open(app_hwnd: HWND, title: &str) -> Result<HWND, String> {
         let state = Box::new(ResultState {
             edit: HWND::default(),
             copy_btn: HWND::default(),
+            copy_md_btn: HWND::default(),
             stop_btn: HWND::default(),
             close_btn: HWND::default(),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -199,11 +244,15 @@ pub fn start_stream(
 ) -> Result<(), String> {
     let state = state(hwnd).ok_or_else(|| "结果窗口状态丢失".to_string())?;
 
+    let render_markdown = settings.markdown_render;
+    let render_local_images = settings.render_local_images;
+
     let mut shared = state.shared.lock().map_err(|_| "状态锁失败".to_string())?;
     shared.pending.clear();
     shared.full.clear();
     shared.finished = false;
     shared.error = None;
+    shared.rendered = None;
     drop(shared);
 
     set_edit_text(state.edit, "");
@@ -242,6 +291,33 @@ pub fn start_stream(
                 ChatDelta::Done => {
                     if let Ok(mut guard) = shared.lock() {
                         guard.finished = true;
+                    }
+                    if render_markdown {
+                        let full = shared
+                            .lock()
+                            .map(|guard| guard.full.clone())
+                            .unwrap_or_default();
+                        if !full.is_empty() {
+                            let rendered = std::panic::catch_unwind(
+                                std::panic::AssertUnwindSafe(|| {
+                                    markdown::to_rtf_with(
+                                        &full,
+                                        RenderOptions {
+                                            embed_local_images: render_local_images,
+                                        },
+                                    )
+                                }),
+                            );
+                            match rendered {
+                                Ok(rtf) => {
+                                    if let Ok(mut guard) = shared.lock() {
+                                        guard.rendered = Some(rtf);
+                                    }
+                                    dbg("markdown rendered");
+                                }
+                                Err(_) => dbg("markdown render panicked; keeping plain text"),
+                            }
+                        }
                     }
                     post(WM_XUANCI_RESULT_DONE);
                 }
@@ -335,6 +411,40 @@ fn append_edit_text(edit: HWND, text: &str) {
     }
 }
 
+/// Loads pre-rendered RTF into the read-only RichEdit control.
+fn load_rtf(edit: HWND, rtf: &str) -> bool {
+    dbg(&format!("load_rtf begin len={}", rtf.len()));
+    unsafe {
+        let mut stream = RtfStream {
+            bytes: rtf.as_bytes().to_vec(),
+            position: 0,
+        };
+        let mut edit_stream = EDITSTREAM {
+            dwCookie: &mut stream as *mut RtfStream as usize,
+            dwError: 0,
+            pfnCallback: Some(rtf_stream_callback),
+        };
+        let loaded = SendMessageW(
+            edit,
+            EM_STREAMIN,
+            Some(WPARAM(SF_RTF as usize)),
+            Some(LPARAM(&mut edit_stream as *mut EDITSTREAM as isize)),
+        )
+        .0;
+        let error = edit_stream.dwError;
+        dbg(&format!(
+            "load_rtf streamin returned loaded={loaded} error={error}"
+        ));
+        if error != 0 || loaded <= 0 {
+            return false;
+        }
+        SendMessageW(edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(0)));
+        SendMessageW(edit, EM_SCROLLCARET, Some(WPARAM(0)), Some(LPARAM(0)));
+        dbg("load_rtf done");
+        true
+    }
+}
+
 fn read_edit_text(edit: HWND) -> String {
     unsafe {
         let len = SendMessageW(
@@ -384,11 +494,45 @@ fn layout(hwnd: HWND) {
 
         let by = height - BUTTON_H - 10;
         let mut bx = width - MARGIN - BUTTON_W;
-        let _ = SetWindowPos(state.close_btn, Some(HWND_TOP), bx, by, BUTTON_W, BUTTON_H, SWP_NOZORDER);
+        let _ = SetWindowPos(
+            state.close_btn,
+            Some(HWND_TOP),
+            bx,
+            by,
+            BUTTON_W,
+            BUTTON_H,
+            SWP_NOZORDER,
+        );
         bx -= BUTTON_W + 8;
-        let _ = SetWindowPos(state.stop_btn, Some(HWND_TOP), bx, by, BUTTON_W, BUTTON_H, SWP_NOZORDER);
+        let _ = SetWindowPos(
+            state.stop_btn,
+            Some(HWND_TOP),
+            bx,
+            by,
+            BUTTON_W,
+            BUTTON_H,
+            SWP_NOZORDER,
+        );
+        bx -= COPY_MD_W + 8;
+        let _ = SetWindowPos(
+            state.copy_md_btn,
+            Some(HWND_TOP),
+            bx,
+            by,
+            COPY_MD_W,
+            BUTTON_H,
+            SWP_NOZORDER,
+        );
         bx -= BUTTON_W + 8;
-        let _ = SetWindowPos(state.copy_btn, Some(HWND_TOP), bx, by, BUTTON_W, BUTTON_H, SWP_NOZORDER);
+        let _ = SetWindowPos(
+            state.copy_btn,
+            Some(HWND_TOP),
+            bx.max(MARGIN),
+            by,
+            BUTTON_W,
+            BUTTON_H,
+            SWP_NOZORDER,
+        );
     }
 }
 
@@ -435,13 +579,20 @@ fn create_controls(hwnd: HWND, state: &mut ResultState, hinstance: HINSTANCE) {
             .unwrap_or_default()
         };
         state.copy_btn = make_button(w!("复制"), BTN_COPY);
+        state.copy_md_btn = make_button(w!("复制 Markdown"), BTN_COPY_MD);
         state.stop_btn = make_button(w!("停止"), BTN_STOP);
         state.close_btn = make_button(w!("关闭"), BTN_CLOSE);
 
         let font = windows::Win32::Graphics::Gdi::GetStockObject(
             windows::Win32::Graphics::Gdi::DEFAULT_GUI_FONT,
         );
-        for control in [state.edit, state.copy_btn, state.stop_btn, state.close_btn] {
+        for control in [
+            state.edit,
+            state.copy_btn,
+            state.copy_md_btn,
+            state.stop_btn,
+            state.close_btn,
+        ] {
             SendMessageW(
                 control,
                 WM_SETFONT,
@@ -490,6 +641,19 @@ unsafe extern "system" fn result_proc(
                             }
                         }
                     }
+                } else if id == BTN_COPY_MD {
+                    if let Some(state) = state(hwnd) {
+                        let markdown = state
+                            .shared
+                            .lock()
+                            .map(|guard| guard.full.clone())
+                            .unwrap_or_default();
+                        if !markdown.is_empty() {
+                            if let Err(e) = clipboard::set_text(&markdown) {
+                                set_title(hwnd, &format!("复制失败：{e}"));
+                            }
+                        }
+                    }
                 } else if id == BTN_STOP {
                     if let Some(state) = state(hwnd) {
                         state.cancel.store(true, Ordering::Relaxed);
@@ -516,10 +680,16 @@ unsafe extern "system" fn result_proc(
             }
             WM_XUANCI_RESULT_DONE => {
                 if let Some(state) = state(hwnd) {
-                    let (error, full) = state
+                    let (error, full, rendered) = state
                         .shared
                         .lock()
-                        .map(|guard| (guard.error.clone(), guard.full.clone()))
+                        .map(|mut guard| {
+                            (
+                                guard.error.clone(),
+                                guard.full.clone(),
+                                guard.rendered.take(),
+                            )
+                        })
                         .unwrap_or_default();
                     state.streaming = false;
                     state.cancel.store(true, Ordering::Relaxed);
@@ -529,6 +699,11 @@ unsafe extern "system" fn result_proc(
                         }
                         set_title(hwnd, &format!("XuanCi · {error}"));
                     } else {
+                        if let Some(rtf) = rendered {
+                            if !load_rtf(state.edit, &rtf) {
+                                dbg("RTF load failed; plain text remains");
+                            }
+                        }
                         set_title(hwnd, "XuanCi · 完成");
                     }
                 }

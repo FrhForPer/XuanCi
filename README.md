@@ -16,7 +16,10 @@ Windows 全局划词工具：在任意软件中选中文字，自动弹出小工
 | 全局快捷键 | `Ctrl+Alt+D` 翻译，`Ctrl+Alt+Q` 让 AI 解释（v1 固定，占用时会提示） |
 | 取词 | UI Automation 优先；UIA 失败时用 Ctrl+C 剪贴板回退并恢复原剪贴板（热键与自动弹条均可，可在托盘关闭） |
 | 安全策略 | 密码框拒绝、管理员程序提示、终端禁用 Ctrl+C、文件/图片剪贴板回退保护 |
-| 流式结果窗 | 可滚动、复制、停止、关闭 |
+| 流式结果窗 | 可滚动、复制纯文本、复制 Markdown、停止、关闭 |
+| Markdown 渲染 | 流式阶段显示纯文本，完成后渲染为富文本；支持标题、列表、任务列表、表格、引用、代码块、脚注、删除线、行内代码、链接；可在托盘关闭并回退纯文本 |
+| 代码高亮 | 代码块按语言高亮（Rust/Python/JS/TS/C/C++/JSON/Shell/SQL 等 syntect 内置语言），未知语言回退等宽文本 |
+| 本地图片 | 默认关闭；开启后可嵌入 Markdown 中引用的本地 PNG/JPEG（仅绝对路径，单张 ≤2 MB） |
 | 模板扩展 | `%LOCALAPPDATA%\XuanCi\templates.json`，重启后出现在工具条 |
 | 多服务商 | 托盘「服务商」子菜单：切换、添加、编辑、删除；每个服务商独立保存 Key |
 | 自动识别 | 添加服务商时根据 Base URL 识别 DeepSeek/OpenAI/硅基流动/通义/智谱/Moonshot/Ollama/LM Studio，并预填名称与常用模型 |
@@ -57,7 +60,7 @@ cargo build --release
 | 文件 | 内容 |
 |---|---|
 | `secrets.bin` | DPAPI 加密的「服务商 ID → API Key」映射；旧版单 Key 文件会自动迁移 |
-| `settings.json` | 服务商列表、当前服务商、翻译目标语言、是否允许自动弹条使用剪贴板回退（默认模型 `deepseek-flash`，官方另可选 `deepseek-v4-pro`） |
+| `settings.json` | 服务商列表、当前服务商、翻译目标语言、剪贴板回退开关、Markdown 渲染开关、本地图片开关（默认模型 `deepseek-flash`，官方另可选 `deepseek-v4-pro`） |
 | `templates.json` | 提示词模板（见下） |
 
 `settings.json` 中的服务商结构：
@@ -77,6 +80,18 @@ cargo build --release
 ```
 
 顶层 `base_url` / `model` 是当前服务商的镜像，由程序自动维护。旧版只有 `base_url` / `model` 的配置会在启动时自动转成服务商列表。
+
+Markdown 相关设置（均可在托盘菜单切换）：
+
+```json
+{
+  "markdown_render": true,
+  "render_local_images": false
+}
+```
+
+- `markdown_render`：是否把 AI 回复渲染为富文本，默认 `true`；关闭后显示原始 Markdown。
+- `render_local_images`：是否允许嵌入本地 PNG/JPEG，默认 `false`。模型输出可能引用本机文件，开启前请确认你接受这个行为。
 
 `templates.json` 示例：
 
@@ -101,10 +116,14 @@ cargo build --release
 - 日志不记录选中文本、提示词、模型回复、API Key
 - 选中文本只存在于内存，不写历史
 - 进程以普通权限运行，不自动提权
+- Markdown 渲染不执行 HTML/JavaScript，不自动下载远程图片；本地图片默认关闭
+- 链接以蓝色下划线显示并附带 URL，当前版本不是可点击链接
 
 ## 已知限制（v1）
 
-- 结果窗暂以纯文本显示 Markdown（`**粗体**` 等标记原样显示）
+- LaTeX 公式以 `$...$` / `$$...$$` 源码显示，不做公式排版
+- 任务列表的复选框是静态符号，不能点击切换
+- 表格只支持 GFM 基本表格，复杂嵌套表格可能显示不理想
 - 未实现安装包
 - 未实现外部插件运行时（当前扩展方式为 JSON 模板）
 - 不支持 OCR/截图取词、触控/触控笔划词
