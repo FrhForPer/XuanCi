@@ -951,6 +951,142 @@ fn escape_into(text: &str, out: &mut String) {
     }
 }
 
+/// Many models emit `\(...\)` and `\[...\]` instead of dollar delimiters.
+/// pulldown-cmark only understands `$...$` and `$$...$$`, so rewrite the
+/// backslash forms before parsing. Code fences and inline code are left alone.
+fn normalize_math_delimiters(markdown: &str) -> String {
+    let chars: Vec<char> = markdown.chars().collect();
+    let mut out = String::with_capacity(markdown.len());
+    let mut i = 0;
+    let mut line_start = true;
+    let mut fence: Option<(char, usize)> = None;
+    let mut in_inline_code = false;
+    let mut inline_ticks = 0usize;
+
+    while i < chars.len() {
+        // Fenced code blocks are copied verbatim.
+        if line_start && !in_inline_code {
+            let mut j = i;
+            let mut spaces = 0;
+            while j < chars.len() && chars[j] == ' ' && spaces < 4 {
+                j += 1;
+                spaces += 1;
+            }
+            if spaces <= 3
+                && j < chars.len()
+                && (chars[j] == '`' || chars[j] == '~')
+            {
+                let marker = chars[j];
+                let mut end = j;
+                while end < chars.len() && chars[end] == marker {
+                    end += 1;
+                }
+                if end - j >= 3 {
+                    if let Some((open, len)) = fence {
+                        if marker == open && end - j >= len {
+                            fence = None;
+                        }
+                    } else {
+                        fence = Some((marker, end - j));
+                    }
+                    let mut newline = false;
+                    while i < chars.len() {
+                        let ch = chars[i];
+                        out.push(ch);
+                        i += 1;
+                        if ch == '\n' {
+                            newline = true;
+                            break;
+                        }
+                    }
+                    line_start = newline;
+                    continue;
+                }
+            }
+        }
+
+        if fence.is_some() {
+            let ch = chars[i];
+            out.push(ch);
+            i += 1;
+            line_start = ch == '\n';
+            continue;
+        }
+
+        // Inline code spans use one or more backticks and are copied verbatim.
+        if chars[i] == '`' {
+            let mut end = i;
+            while end < chars.len() && chars[end] == '`' {
+                end += 1;
+            }
+            let run = end - i;
+            if !in_inline_code {
+                in_inline_code = true;
+                inline_ticks = run;
+            } else if run == inline_ticks {
+                in_inline_code = false;
+                inline_ticks = 0;
+            }
+            for ch in &chars[i..end] {
+                out.push(*ch);
+            }
+            i = end;
+            line_start = false;
+            continue;
+        }
+
+        if !in_inline_code && chars[i] == '\\' && i + 1 < chars.len() {
+            let marker = chars[i + 1];
+            // Two consecutive backslashes are an escaped backslash, not a
+            // math delimiter.
+            if marker == '\\' {
+                out.push('\\');
+                out.push('\\');
+                i += 2;
+                line_start = false;
+                continue;
+            }
+            if marker == '(' || marker == '[' {
+                let close = if marker == '(' { ')' } else { ']' };
+                let mut end = i + 2;
+                let mut found = None;
+                while end + 1 < chars.len() {
+                    if chars[end] == '\\' && chars[end + 1] == close {
+                        found = Some(end);
+                        break;
+                    }
+                    end += 1;
+                }
+                if let Some(end) = found {
+                    let content: String = chars[i + 2..end].iter().collect();
+                    let trimmed = content.trim();
+                    if !trimmed.is_empty() {
+                        if marker == '(' {
+                            out.push('$');
+                            out.push_str(trimmed);
+                            out.push('$');
+                        } else {
+                            out.push_str("$$");
+                            out.push_str(trimmed);
+                            out.push_str("$$");
+                        }
+                        i = end + 2;
+                        line_start = false;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        let ch = chars[i];
+        out.push(ch);
+        i += 1;
+        line_start = ch == '\n';
+    }
+
+    out
+}
+
 fn options_flags() -> Options {
     Options::ENABLE_TABLES
         | Options::ENABLE_FOOTNOTES
@@ -980,6 +1116,7 @@ pub fn to_rtf_with_math(
     } else {
         markdown.to_string()
     };
+    let input = normalize_math_delimiters(&input);
     let mut rtf = Rtf::new(options, math_renderer);
     for event in Parser::new_ext(&input, options_flags()) {
         match event {
@@ -1089,6 +1226,47 @@ mod tests {
         );
         assert!(!plain.contains("{\\cf"));
         assert!(plain.contains("fn main()"));
+    }
+
+    #[test]
+    fn normalizes_backslash_math_delimiters() {
+        use crate::latex_plugin::{MathSegment, MathStyle};
+        use std::cell::Cell;
+
+        let calls = Cell::new(0);
+        let renderer = |tex: &str, _display: bool| {
+            calls.set(calls.get() + 1);
+            Some(MathFragment {
+                segments: vec![MathSegment {
+                    text: format!("M<{tex}>"),
+                    style: MathStyle::Normal,
+                }],
+            })
+        };
+        let rtf = to_rtf_with_math(
+            "行内 \\(a+b\\) 与\n\n\\[c+d\\]\n",
+            RenderOptions::default(),
+            Some(&renderer),
+        );
+
+        assert_eq!(calls.get(), 2);
+        assert!(rtf.contains("M<a+b>"));
+        assert!(rtf.contains("M<c+d>"));
+    }
+
+    #[test]
+    fn leaves_backslash_math_in_code_untouched() {
+        let source = "```\n\\(a\\)\n```\n\n`\\(b\\)`\n\n\\(c\\)";
+        let normalized = normalize_math_delimiters(source);
+
+        assert!(normalized.contains("\\(a\\)"));
+        assert!(normalized.contains("`\\(b\\)`"));
+        assert!(normalized.contains("$c$"));
+    }
+
+    #[test]
+    fn escaped_backslashes_are_not_math_delimiters() {
+        assert_eq!(normalize_math_delimiters(r"\\(x\\)"), r"\\(x\\)");
     }
 
     #[test]
