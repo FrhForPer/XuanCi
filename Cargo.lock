@@ -904,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "xuanci-app"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde_json",
  "windows",
@@ -914,7 +914,7 @@ dependencies = [
 
 [[package]]
 name = "xuanci-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "pulldown-cmark",
  "serde",
@@ -925,7 +925,7 @@ dependencies = [
 
 [[package]]
 name = "xuanci-win"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "windows",
  "xuanci-core",
